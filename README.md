@@ -2,6 +2,16 @@
 
 AI-Ready is a knowledge observability that ensure the quality of knowledge before it reaches an AI system. Rather than evaluating language models or retrieval algorithms, it analyzes the knowledge repositories that those systems depend on, including documentation, APIs, runbooks, and internal wikis. The engine transforms various sources into a unified artifact model, collects deterministic signals that describe measurable properties of the knowledge, and interprets those signals into assessments that reflect their potential impact on AI reasoning. These assessments are persisted over time, allowing organizations to detect regressions, monitor the evolution of their knowledge base, and understand how changes affect AI readiness. The analysis pipeline is orchestrated as a deterministic workflow using Burr, ensuring every stage of collection, interpretation, and assessment follows an explicit, reproducible execution graph.
 
+## What it does
+- **`ai-ready collect`** — Discovers and normalizes knowledge from documentation, APIs, runbooks, and other supported sources into a unified Knowledge Artifact model.
+- **`ai-ready assess`** — Collects deterministic Knowledge Signals, applies interpretation policies, and produces a versioned Knowledge Assessment.
+- **`ai-ready diff`** — Compares two assessments to identify new issues, resolved issues, and knowledge regressions.
+- **`ai-ready history`** — Tracks how knowledge quality evolves across historical assessments.
+- **`ai-ready explain`** — Shows the evidence behind every signal and assessment, making every result explainable and reproducible.
+- **`ai-ready check`** — Executes the complete analysis pipeline and returns results suitable for CI/CD quality gates.
+- **`ai-ready serve`** — Exposes AI-Ready as a service for integration with engineering workflows and AI platforms.
+- **`ai-ready connectors`** — Lists available connectors and supported knowledge sources.
+
 ## Quick Start
 
 ```bash
