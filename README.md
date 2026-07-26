@@ -1,15 +1,6 @@
 # AI-Ready
 
-AI knowledge observability platform — continuously evaluate whether a knowledge base is AI-ready before deployment and as it evolves over time.
-
-## What It Does
-
-AI-Ready analyzes your documentation knowledge base and detects structural properties that cause AI failures:
-
-- **Topic Purity** — documents mixing unrelated concepts
-- **Context Independence** — chunks that can't stand alone when retrieved
-- **Heading Quality** — vague headings that provide weak retrieval signals
-- **Link Integrity** — broken links and orphan documents
+AI-Ready is a knowledge observability that ensure the quality of knowledge before it reaches an AI system. Rather than evaluating language models or retrieval algorithms, it analyzes the knowledge repositories that those systems depend on, including documentation, APIs, runbooks, and internal wikis. The engine transforms various sources into a unified artifact model, collects deterministic signals that describe measurable properties of the knowledge, and interprets those signals into assessments that reflect their potential impact on AI reasoning. These assessments are persisted over time, allowing organizations to detect regressions, monitor the evolution of their knowledge base, and understand how changes affect AI readiness. The analysis pipeline is orchestrated as a deterministic workflow using Burr, ensuring every stage of collection, interpretation, and assessment follows an explicit, reproducible execution graph.
 
 ## Quick Start
 
