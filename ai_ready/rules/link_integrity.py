@@ -1,8 +1,8 @@
-"""Link Integrity rule - detect broken, redirect, and orphan links.
+"""Link Integrity collector - detect broken, redirect, and orphan links.
 
-Uses document relationships from the KnowledgeBase to avoid false-positive
-orphan detection. A document is only an orphan if it is not linked from any
-other document AND not present in the navigation hierarchy.
+Uses artifact relationships from the ArtifactBundle to avoid false-positive
+orphan detection. An artifact is only an orphan if it is not linked from any
+other artifact AND not present in the navigation hierarchy.
 """
 
 from __future__ import annotations
@@ -11,13 +11,13 @@ import os
 import re
 from typing import Any
 
-from ai_ready.models import Finding, KnowledgeBase, RuleResult, Severity
-from ai_ready.rules import Rule, register_rule
+from ai_ready.models import ArtifactBundle, CollectorResult, KnowledgeSignal, Severity
+from ai_ready.rules import SignalCollector, register_collector
 
 
-@register_rule
-class LinkIntegrityRule(Rule):
-    """Check internal links for broken references and detect orphan documents."""
+@register_collector
+class LinkIntegrityCollector(SignalCollector):
+    """Check internal links for broken references and detect orphan artifacts."""
 
     id = "link_integrity"
     severity_default = Severity.MEDIUM
@@ -26,14 +26,14 @@ class LinkIntegrityRule(Rule):
     def __init__(self) -> None:
         self._source_path: str | None = None
 
-    def collect(self, kb: KnowledgeBase) -> dict[str, Any]:
-        """Collect all links and check their targets. Use relations for orphan detection."""
+    def collect(self, bundle: ArtifactBundle) -> dict[str, Any]:
+        """Collect all links and check their targets. Use relationships for orphan detection."""
         all_links: list[dict[str, Any]] = []
-        doc_paths = {doc.path for doc in kb.documents}
-        doc_dirs = {os.path.dirname(doc.path) for doc in kb.documents}
+        doc_paths = {artifact.uri for artifact in bundle.artifacts}
+        doc_dirs = {os.path.dirname(artifact.uri) for artifact in bundle.artifacts}
 
-        for doc in kb.documents:
-            for link in doc.links:
+        for artifact in bundle.artifacts:
+            for link in artifact.links:
                 if not link.is_internal:
                     continue
 
@@ -51,13 +51,13 @@ class LinkIntegrityRule(Rule):
                     # Pure anchor link - skip
                     continue
 
-                # Check if target exists relative to doc's directory and source root
-                doc_dir = os.path.dirname(doc.path)
+                # Check if target exists relative to artifact's directory and source root
+                doc_dir = os.path.dirname(artifact.uri)
                 resolved = self._resolve_link(target, doc_dir, doc_paths)
 
                 all_links.append({
-                    "doc_id": doc.id,
-                    "doc_path": doc.path,
+                    "doc_id": artifact.id,
+                    "doc_path": artifact.uri,
                     "link_text": link.text,
                     "link_target": link.target,
                     "clean_target": target,
@@ -68,36 +68,36 @@ class LinkIntegrityRule(Rule):
                     "is_orphan": False,
                 })
 
-        # Check if the link target matches a document path
+        # Check if the link target matches an artifact URI
         for al in all_links:
             if al["clean_target"] in doc_paths:
                 al["resolved_path"] = al["clean_target"]
 
-        # Compute orphan documents using BOTH inline links AND relations
-        # A document is orphan if no other document links to it AND it has no
+        # Compute orphan artifacts using BOTH inline links AND relationships
+        # An artifact is orphan if no other artifact links to it AND it has no
         # parent in the navigation hierarchy
         linked_via_links = {al["resolved_path"] for al in all_links if al["resolved_path"]}
-        linked_via_relations = {r.target_path for r in kb.relations if r.relation_type in ("parent_child", "cross_reference", "navigation")}
+        linked_via_relations = {r.target_uri for r in bundle.relationships if r.relation_type in ("parent_child", "cross_reference", "navigation")}
 
         all_linked = linked_via_links | linked_via_relations
 
         orphan_docs = []
-        for doc in kb.documents:
-            is_linked = doc.path in all_linked
-            # Also check if any relation has this doc as a source (it's a parent, so it's reachable)
-            is_parent = any(r.source_path == doc.path for r in kb.relations if r.relation_type in ("parent_child", "navigation"))
-            if not is_linked and not is_parent and len(kb.documents) > 1:
-                orphan_docs.append({"doc_id": doc.id, "doc_path": doc.path})
+        for artifact in bundle.artifacts:
+            is_linked = artifact.uri in all_linked
+            # Also check if any relationship has this artifact as a source (it's a parent, so it's reachable)
+            is_parent = any(r.source_uri == artifact.uri for r in bundle.relationships if r.relation_type in ("parent_child", "navigation"))
+            if not is_linked and not is_parent and len(bundle.artifacts) > 1:
+                orphan_docs.append({"doc_id": artifact.id, "doc_path": artifact.uri})
 
         return {
             "all_links": all_links,
             "orphan_docs": orphan_docs,
-            "total_docs": len(kb.documents),
-            "total_relations": len(kb.relations),
+            "total_docs": len(bundle.artifacts),
+            "total_relations": len(bundle.relationships),
         }
 
     def measure(self, signals: dict[str, Any]) -> dict[str, Any]:
-        """Count broken links and orphan documents."""
+        """Count broken links and orphan artifacts."""
         broken = [l for l in signals["all_links"] if not l["exists"]]
         orphans = signals["orphan_docs"]
 
@@ -111,28 +111,28 @@ class LinkIntegrityRule(Rule):
             "orphan_count": len(orphans),
         }
 
-    def evaluate(self, metrics: dict[str, Any]) -> list[Finding]:
-        """Create findings for broken links and orphan documents.
+    def evaluate(self, metrics: dict[str, Any]) -> list[KnowledgeSignal]:
+        """Create signals for broken links and orphan artifacts.
 
-        Emits bare findings with issue_type only. Severity, score, and
-        recommendation are assigned by the EvaluationPolicy in the pipeline.
+        Emits bare signals with signal_type only. Severity, score, and
+        recommendation are assigned by the InterpretationPolicy in the pipeline.
         """
-        findings: list[Finding] = []
+        signals: list[KnowledgeSignal] = []
 
-        # Group broken links by document
+        # Group broken links by artifact
         broken_by_doc: dict[str, list[dict[str, Any]]] = {}
         for link in metrics["broken_links"]:
             broken_by_doc.setdefault(link["doc_id"], []).append(link)
 
         for doc_id, links in broken_by_doc.items():
             doc_path = links[0]["doc_path"]
-            findings.append(Finding(
-                rule_id=self.id,
-                issue_type="broken_link",
+            signals.append(KnowledgeSignal(
+                collector_id=self.id,
+                signal_type="broken_link",
                 severity=Severity.LOW,  # Placeholder; overridden by policy
                 score=0,  # Placeholder; overridden by policy
-                document_id=doc_id,
-                document_path=doc_path,
+                artifact_id=doc_id,
+                artifact_uri=doc_path,
                 evidence={
                     "broken_links": [
                         {"target": l["link_target"], "line": l["line"], "text": l["link_text"]}
@@ -143,33 +143,33 @@ class LinkIntegrityRule(Rule):
                 recommendation="",  # Filled by policy
             ))
 
-        # Orphan documents
+        # Orphan artifacts
         for orphan in metrics["orphan_documents"]:
-            findings.append(Finding(
-                rule_id=self.id,
-                issue_type="orphan",
+            signals.append(KnowledgeSignal(
+                collector_id=self.id,
+                signal_type="orphan",
                 severity=Severity.LOW,  # Placeholder; overridden by policy
                 score=0,  # Placeholder; overridden by policy
-                document_id=orphan["doc_id"],
-                document_path=orphan["doc_path"],
+                artifact_id=orphan["doc_id"],
+                artifact_uri=orphan["doc_path"],
                 evidence={"orphan": True},
                 recommendation="",  # Filled by policy
             ))
 
-        return findings
+        return signals
 
-    def report(self) -> RuleResult:
-        findings = self._findings
+    def report(self) -> CollectorResult:
+        signals = self._findings
         broken_count = self._metrics.get("broken_count", 0)
         orphan_count = self._metrics.get("orphan_count", 0)
         total_links = self._metrics.get("total_links", 0)
         total_relations = self._metrics.get("total_relations", 0)
 
         score = max(0, 100 - broken_count * 5 - orphan_count * 2)
-        severity = Severity.HIGH if broken_count > 5 else (Severity.MEDIUM if findings else Severity.LOW)
+        severity = Severity.HIGH if broken_count > 5 else (Severity.MEDIUM if signals else Severity.LOW)
 
-        return RuleResult(
-            rule_id=self.id,
+        return CollectorResult(
+            collector_id=self.id,
             score=score,
             severity=severity,
             metrics={
@@ -178,8 +178,8 @@ class LinkIntegrityRule(Rule):
                 "total_links": total_links,
                 "total_relations": total_relations,
             },
-            findings=findings,
-            recommendation=f"{broken_count} broken links, {orphan_count} orphan documents" if findings else "All links resolve correctly",
+            signals=signals,
+            recommendation=f"{broken_count} broken links, {orphan_count} orphan artifacts" if signals else "All links resolve correctly",
         )
 
     def _resolve_link(self, target: str, doc_dir: str, known_paths: set[str]) -> str | None:
@@ -188,7 +188,7 @@ class LinkIntegrityRule(Rule):
         target = target.replace("\\", "/")
         doc_dir = doc_dir.replace("\\", "/")
 
-        # Try relative to document directory
+        # Try relative to artifact directory
         candidate = os.path.normpath(os.path.join(doc_dir, target)).replace("\\", "/")
         if candidate in known_paths:
             return candidate

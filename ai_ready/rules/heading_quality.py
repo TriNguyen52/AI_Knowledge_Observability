@@ -1,12 +1,12 @@
-"""Heading Quality rule — evaluate whether headings provide strong retrieval signals."""
+"""Heading Quality collector — evaluate whether headings provide strong retrieval signals."""
 
 from __future__ import annotations
 
 import re
 from typing import Any
 
-from ai_ready.models import Finding, KnowledgeBase, RuleResult, Severity
-from ai_ready.rules import Rule, register_rule
+from ai_ready.models import ArtifactBundle, CollectorResult, KnowledgeSignal, Severity
+from ai_ready.rules import SignalCollector, register_collector
 
 # Generic/vague headings that provide weak retrieval signals
 GENERIC_HEADINGS = {
@@ -24,19 +24,19 @@ PLACEHOLDER_HEADINGS = {"todo", "tbd", "placeholder", "coming soon", "wip", "n/a
 GOOD_SINGLE_WORDS = {"api", "sdk", "cli", "faq", "changelog", "graphql", "rest", "grpc", "css", "html", "sql"}
 
 
-@register_rule
-class HeadingQualityRule(Rule):
+@register_collector
+class HeadingQualityCollector(SignalCollector):
     """Detect vague, numbered-only, placeholder, or too-short headings."""
 
     id = "heading_quality"
     severity_default = Severity.MEDIUM
     dimension = "retrieval"
 
-    def collect(self, kb: KnowledgeBase) -> dict[str, Any]:
+    def collect(self, bundle: ArtifactBundle) -> dict[str, Any]:
         """Extract all headings with quality signals."""
         all_headings: list[dict[str, Any]] = []
-        for doc in kb.documents:
-            for heading in doc.headings:
+        for artifact in bundle.artifacts:
+            for heading in artifact.headings:
                 text = heading.text.strip()
                 text_lower = text.lower()
 
@@ -65,8 +65,8 @@ class HeadingQualityRule(Rule):
 
                 if issue_type:
                     all_headings.append({
-                        "doc_id": doc.id,
-                        "doc_path": doc.path,
+                        "doc_id": artifact.id,
+                        "doc_path": artifact.uri,
                         "heading_text": text,
                         "heading_level": heading.level,
                         "heading_line": heading.line,
@@ -88,21 +88,21 @@ class HeadingQualityRule(Rule):
             "total_issues": len(signals["bad_headings"]),
         }
 
-    def evaluate(self, metrics: dict[str, Any]) -> list[Finding]:
-        """Create findings for each bad heading.
+    def evaluate(self, metrics: dict[str, Any]) -> list[KnowledgeSignal]:
+        """Create signals for each bad heading.
 
-        Emits bare findings with issue_type only. Severity, score, and
-        recommendation are assigned by the EvaluationPolicy in the pipeline.
+        Emits bare signals with signal_type only. Severity, score, and
+        recommendation are assigned by the InterpretationPolicy in the pipeline.
         """
-        findings: list[Finding] = []
+        signals: list[KnowledgeSignal] = []
         for h in metrics["bad_headings"]:
-            findings.append(Finding(
-                rule_id=self.id,
-                issue_type=h["issue_type"],
+            signals.append(KnowledgeSignal(
+                collector_id=self.id,
+                signal_type=h["issue_type"],
                 severity=Severity.LOW,  # Placeholder; overridden by policy
                 score=0,  # Placeholder; overridden by policy
-                document_id=h["doc_id"],
-                document_path=h["doc_path"],
+                artifact_id=h["doc_id"],
+                artifact_uri=h["doc_path"],
                 evidence={
                     "heading": h["heading_text"],
                     "level": h["heading_level"],
@@ -111,29 +111,29 @@ class HeadingQualityRule(Rule):
                 recommendation="",  # Filled by policy
                 line=h["heading_line"],
             ))
-        return findings
+        return signals
 
-    def report(self) -> RuleResult:
-        findings = self._findings
+    def report(self) -> CollectorResult:
+        signals = self._findings
         by_type = self._metrics.get("by_type", {})
         total = self._metrics.get("total_issues", 0)
 
-        # Placeholder score; pipeline recomputes from assessed findings
+        # Placeholder score; pipeline recomputes from assessed signals
         score = max(0, 100 - total * 5)
-        severity = Severity.HIGH if any(f.issue_type in ("placeholder", "numbered_only") for f in findings) else (
-            Severity.MEDIUM if findings else Severity.LOW
+        severity = Severity.HIGH if any(s.signal_type in ("placeholder", "numbered_only") for s in signals) else (
+            Severity.MEDIUM if signals else Severity.LOW
         )
 
-        return RuleResult(
-            rule_id=self.id,
+        return CollectorResult(
+            collector_id=self.id,
             score=score,
             severity=severity,
             metrics={
                 "total_heading_issues": total,
                 "by_type": by_type,
             },
-            findings=findings,
-            recommendation=f"{total} heading quality issues ({', '.join(f'{k}: {v}' for k, v in by_type.items())})" if findings else "All headings provide strong retrieval signals",
+            signals=signals,
+            recommendation=f"{total} heading quality issues ({', '.join(f'{k}: {v}' for k, v in by_type.items())})" if signals else "All headings provide strong retrieval signals",
         )
 
     def _make_recommendation(self, issue_type: str, heading: str) -> str:

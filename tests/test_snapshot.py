@@ -25,16 +25,20 @@ def _make_finding(
     doc_id: str = "doc1",
     evidence: dict | None = None,
     fid: str = "",
+    issue_type: str = "mixed_topics",
+    score: int = 85,
 ) -> Finding:
     return Finding(
         finding_id=fid,
         rule_id=rule_id,
+        issue_type=issue_type,
         severity=severity,
-        score=50,
+        score=score,
         document_id=doc_id,
         document_path=doc_path,
         evidence=evidence or {"cluster_count": 3},
         recommendation="Fix",
+        ai_impact="Impact",
         line=5,
     )
 
@@ -44,7 +48,7 @@ def _make_snapshot(score: int = 90, findings: list | None = None, sid: str | Non
         snapshot_id=sid or f"test-{score}",
         score=score,
         dimensions={
-            "retrieval": DimensionScore(name="retrieval", score=score, rule_ids=["topic_purity"]),
+            "retrieval": DimensionScore(name="retrieval", score=score, rule_ids=["topic_purity", "heading_quality"]),
             "context": DimensionScore(name="context", score=score, rule_ids=["context_independence"]),
         },
         findings=findings or [],
@@ -114,10 +118,46 @@ def test_snapshot_with_findings():
         assert loaded is not None
         assert len(loaded.findings) == 1
         assert loaded.findings[0].rule_id == "topic_purity"
+        assert loaded.findings[0].issue_type == "mixed_topics"
+        assert loaded.findings[0].ai_impact == "Impact"
         assert loaded.findings[0].severity == Severity.HIGH
         assert loaded.findings[0].finding_id  # Should have a finding_id
     finally:
         _cleanup_db()
+
+
+def test_snapshot_score_explanation_groups_repeated_causes():
+    findings = [
+        _make_finding(
+            rule_id="heading_quality",
+            issue_type="generic",
+            doc_path="a.md",
+            doc_id="a",
+            evidence={"heading": "Overview", "issue_type": "generic"},
+            fid="h1",
+            score=90,
+        ),
+        _make_finding(
+            rule_id="heading_quality",
+            issue_type="generic",
+            doc_path="b.md",
+            doc_id="b",
+            evidence={"heading": "Overview", "issue_type": "generic"},
+            fid="h2",
+            score=90,
+        ),
+    ]
+    snap = _make_snapshot(score=95, findings=findings, sid="snap-explain")
+    snap.metadata["weights"] = {"retrieval": 1.0, "context": 0.0}
+
+    explanation = snap.explain_score()
+
+    assert explanation.dominant_contributors
+    contributor = explanation.dominant_contributors[0]
+    assert contributor.cause == "generic heading 'Overview'"
+    assert contributor.finding_count == 2
+    assert contributor.finding_ids == ["h1", "h2"]
+    assert contributor.estimated_score_gain > 0
 
 
 # --- Regression / Diff ---
@@ -149,6 +189,63 @@ def test_regression_diff():
         assert report.prev_snapshot_id == "snap-1"
         assert report.curr_snapshot_id == "snap-2"
         assert report.explanation
+    finally:
+        _cleanup_db()
+
+
+def test_regression_explains_contributor_changes():
+    _cleanup_db()
+    try:
+        store = SnapshotStore(TEST_DB)
+
+        prev = _make_snapshot(score=95, sid="snap-1")
+        prev.metadata["weights"] = {"retrieval": 1.0, "context": 0.0}
+        prev.findings = [
+            _make_finding(
+                rule_id="heading_quality",
+                issue_type="generic",
+                doc_path="a.md",
+                doc_id="a",
+                evidence={"heading": "Overview", "issue_type": "generic"},
+                fid="h1",
+                score=90,
+            )
+        ]
+        store.save(prev)
+
+        curr = _make_snapshot(score=85, sid="snap-2")
+        curr.metadata["weights"] = {"retrieval": 1.0, "context": 0.0}
+        curr.findings = [
+            _make_finding(
+                rule_id="heading_quality",
+                issue_type="generic",
+                doc_path="a.md",
+                doc_id="a",
+                evidence={"heading": "Overview", "issue_type": "generic"},
+                fid="h1",
+                score=90,
+            ),
+            _make_finding(
+                rule_id="heading_quality",
+                issue_type="generic",
+                doc_path="b.md",
+                doc_id="b",
+                evidence={"heading": "Overview", "issue_type": "generic"},
+                fid="h2",
+                score=90,
+            ),
+        ]
+        store.save(curr)
+
+        report = store.diff("snap-1", "snap-2")
+
+        assert report is not None
+        assert report.score_change_explanation["top_regressions"]
+        top = report.score_change_explanation["top_regressions"][0]
+        assert top["cause"] == "generic heading 'Overview'"
+        assert top["prev_findings"] == 1
+        assert top["curr_findings"] == 2
+        assert top["added_finding_ids"] == ["h2"]
     finally:
         _cleanup_db()
 

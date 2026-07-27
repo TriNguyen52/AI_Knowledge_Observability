@@ -1,4 +1,10 @@
-"""Scan pipeline - runs rules against a KB and aggregates results into a snapshot."""
+"""Assessment pipeline - runs collectors against an artifact bundle and aggregates results into an assessment.
+
+AssessmentPipeline is a facade that delegates to CollectOperation and
+AssessOperation. The collect phase runs collectors and produces raw signals.
+The assess phase applies interpretation policy, aggregates dimensions, and
+computes the overall score.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +12,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ai_ready.evaluation_policy import EvaluationPolicy
-from ai_ready.models import DimensionScore, DocumentRelation, Finding, KnowledgeBase, RuleResult, Severity, Snapshot
-from ai_ready.rules import Rule, all_rules
+from ai_ready.evaluation_policy import InterpretationPolicy
+from ai_ready.models import (
+    ArtifactBundle,
+    CollectorResult,
+    DimensionScore,
+    KnowledgeArtifact,
+    KnowledgeAssessment,
+    KnowledgeSignal,
+    Relationship,
+    Severity,
+)
+from ai_ready.rules import SignalCollector, all_collectors
+from ai_ready.operations import CollectOperation, AssessOperation
 
 # Default dimension weights
 DEFAULT_WEIGHTS: dict[str, float] = {
@@ -28,168 +44,120 @@ DEFAULT_THRESHOLDS = {
 DEFAULT_FAIL_ON: list[str] = ["CRITICAL"]
 
 
-class ScanPipeline:
-    """Orchestrates rule execution, dimension aggregation, and snapshot creation."""
+class AssessmentPipeline:
+    """Orchestrates collector execution, dimension aggregation, and assessment creation.
+
+    Delegates to CollectOperation (run collectors -> raw signals) and
+    AssessOperation (apply policy -> aggregate dimensions -> compute score).
+    """
 
     def __init__(
         self,
         weights: dict[str, float] | None = None,
-        enabled_rules: list[str] | None = None,
+        enabled_collectors: list[str] | None = None,
         thresholds: dict[str, Any] | None = None,
         fail_on: list[str] | None = None,
     ) -> None:
         self.weights = weights if weights is not None else DEFAULT_WEIGHTS
         self.thresholds = thresholds if thresholds is not None else DEFAULT_THRESHOLDS
         self.fail_on = fail_on if fail_on is not None else DEFAULT_FAIL_ON
-        self.enabled_rules = enabled_rules
-        self.policy = EvaluationPolicy()
+        self.enabled_collectors = enabled_collectors
+        self.policy = InterpretationPolicy()
+
+        # Create delegate operations
+        self._collect_op = CollectOperation(enabled_collectors=enabled_collectors)
+        self._assess_op = AssessOperation(weights=self.weights, policy=self.policy)
 
     def run(
         self,
-        documents: list,
+        artifacts: list[KnowledgeArtifact],
         source: str = "",
         git_commit: str = "",
-        relations: list[DocumentRelation] | None = None,
-    ) -> Snapshot:
-        """Run all enabled rules and produce a snapshot.
+        relationships: list[Relationship] | None = None,
+    ) -> KnowledgeAssessment:
+        """Run all enabled collectors and produce an assessment.
+
+        Delegates to CollectOperation then AssessOperation.
 
         Args:
-            documents: List of Document objects to analyze.
+            artifacts: List of KnowledgeArtifact objects to analyze.
             source: Source path string for metadata.
             git_commit: Git commit hash for metadata.
-            relations: Optional list of DocumentRelation objects for document relationships.
+            relationships: Optional list of Relationship objects for artifact relationships.
         """
-        # Build knowledge base
-        kb = KnowledgeBase(
-            documents=documents,
-            relations=relations or [],
+        # Collect phase: run collectors -> raw signals
+        results, all_signals, bundle = self._collect_op.run(
+            artifacts=artifacts,
+            relationships=relationships,
             source=source,
         )
 
-        # Get available rules
-        registry = all_rules()
-        if self.enabled_rules:
-            rule_ids = [r for r in self.enabled_rules if r in registry]
-        else:
-            rule_ids = list(registry.keys())
-
-        # Run each rule
-        results: list[RuleResult] = []
-        all_findings: list[Finding] = []
-        for rule_id in rule_ids:
-            rule_cls = registry[rule_id]
-            rule = rule_cls()
-            result = rule.run(kb)
-            results.append(result)
-            all_findings.extend(result.findings)
-
-        # Apply policy to all findings (enrich bare findings with severity, score, etc.)
-        self._apply_policy(all_findings)
-
-        # Aggregate into dimensions (recompute rule scores from assessed findings)
-        dimensions = self._aggregate_dimensions(results, all_findings)
-
-        # Compute overall score
-        overall_score = self._compute_overall_score(dimensions)
-
-        # Collect metrics
-        metrics: dict[str, Any] = {}
-        for r in results:
-            metrics.update(r.metrics)
-
-        # Create snapshot
-        snapshot_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        metadata: dict[str, Any] = {"source": source}
-        if git_commit:
-            metadata["git_commit"] = git_commit
-        metadata["document_count"] = len(documents)
-        metadata["relation_count"] = len(kb.relations)
-
-        return Snapshot(
-            snapshot_id=snapshot_id,
-            score=overall_score,
-            dimensions=dimensions,
-            findings=all_findings,
-            metrics=metrics,
-            metadata=metadata,
+        # Assess phase: signals -> apply policy -> aggregate -> score
+        return self._assess_op.run(
+            results=results,
+            signals=all_signals,
+            artifacts=artifacts,
+            bundle=bundle,
+            source=source,
+            git_commit=git_commit,
         )
 
-    def _aggregate_dimensions(
-        self, results: list[RuleResult], findings: list[Finding]
-    ) -> dict[str, DimensionScore]:
-        """Aggregate rule results into dimension scores.
+    def run_incremental(
+        self,
+        prev_assessment: KnowledgeAssessment,
+        change_events: list,
+        artifacts: list[KnowledgeArtifact],
+        relationships: list[Relationship] | None = None,
+        source: str = "",
+        git_commit: str = "",
+    ) -> KnowledgeAssessment:
+        """Run an incremental assessment, updating only affected signals.
 
-        Rule scores are recomputed from policy-assessed findings rather than
-        the placeholder scores emitted by rules.
+        Delegates to IncrementalExecutor, reusing this pipeline's helper
+        methods for policy application, dimension aggregation, and score
+        computation.
+
+        Args:
+            prev_assessment: The previous complete assessment.
+            change_events: List of ChangeEvent objects since the previous assessment.
+            artifacts: ALL current KnowledgeArtifact objects.
+            relationships: ALL current Relationship objects.
+            source: Source path string for metadata.
+            git_commit: Git commit hash for metadata.
+
+        Returns:
+            A KnowledgeAssessment identical to what a full scan would produce.
         """
-        dim_results: dict[str, list[RuleResult]] = {}
-        for r in results:
-            rule_cls = all_rules().get(r.rule_id)
-            if rule_cls:
-                dim = rule_cls.dimension
-                dim_results.setdefault(dim, []).append(r)
+        from ai_ready.incremental import IncrementalExecutor
 
-        dimensions: dict[str, DimensionScore] = {}
-        for dim_name, dim_results_list in dim_results.items():
-            # Recompute rule scores from assessed findings
-            rule_scores = []
-            for r in dim_results_list:
-                rule_findings = [f for f in findings if f.rule_id == r.rule_id]
-                if rule_findings:
-                    # Rule score = 100 - sum of penalties from assessed findings
-                    total_penalty = sum(100 - f.score for f in rule_findings)
-                    rule_score = max(0, 100 - total_penalty)
-                else:
-                    rule_score = 100
-                rule_scores.append(rule_score)
+        executor = IncrementalExecutor(self)
+        return executor.run(
+            prev_assessment=prev_assessment,
+            change_events=change_events,
+            all_artifacts=artifacts,
+            relationships=relationships or [],
+            source=source,
+            git_commit=git_commit,
+        )
 
-            avg_score = int(sum(rule_scores) / len(rule_scores)) if rule_scores else 100
-            rule_ids = [r.rule_id for r in dim_results_list]
-            findings_count = sum(
-                len([f for f in findings if f.rule_id == r.rule_id]) for r in dim_results_list
-            )
+    # --- Delegate methods ---
 
-            dimensions[dim_name] = DimensionScore(
-                name=dim_name,
-                score=avg_score,
-                rule_ids=rule_ids,
-                findings_count=findings_count,
-            )
+    def aggregate_dimensions(
+        self, results: list[CollectorResult], signals: list[KnowledgeSignal]
+    ) -> dict[str, DimensionScore]:
+        """Aggregate collector results into dimension scores. Delegates to AssessOperation."""
+        return self._assess_op.aggregate_dimensions(results, signals)
 
-        return dimensions
+    def apply_policy(self, signals: list[KnowledgeSignal]) -> None:
+        """Populate severity, score, ai_impact, and recommendation from policy. Delegates to AssessOperation."""
+        self._assess_op.apply_policy(signals)
 
-    def _apply_policy(self, findings: list[Finding]) -> None:
-        """Populate severity, score, ai_impact, and recommendation from policy."""
-        for finding in findings:
-            entry = self.policy.lookup(finding.rule_id, finding.issue_type)
-            if entry:
-                finding.severity = entry.severity
-                finding.score = 100 - entry.score_penalty
-                finding.ai_impact = entry.ai_impact
-                # Format recommendation template with evidence data
-                finding.recommendation = entry.recommendation_template.format(
-                    **finding.evidence
-                )
-            else:
-                # Fallback if policy entry not found
-                finding.ai_impact = "No AI impact description available."
-                finding.recommendation = f"Issue: {finding.issue_type}"
+    def compute_overall_score(self, dimensions: dict[str, DimensionScore]) -> int:
+        """Compute weighted average of dimension scores. Delegates to AssessOperation."""
+        return self._assess_op.compute_overall_score(dimensions)
 
-    def _compute_overall_score(self, dimensions: dict[str, DimensionScore]) -> int:
-        """Compute weighted average of dimension scores."""
-        total_weight = 0.0
-        weighted_sum = 0.0
-        for dim_name, dim_score in dimensions.items():
-            weight = self.weights.get(dim_name, 0)
-            weighted_sum += dim_score.score * weight
-            total_weight += weight
-
-        if total_weight == 0:
-            return 100
-        return int(weighted_sum / total_weight)
-
-    def get_exit_code(self, snapshot: Snapshot) -> int:
-        """Determine exit code based on snapshot results."""
+    def get_exit_code(self, assessment: KnowledgeAssessment) -> int:
+        """Determine exit code based on assessment results."""
         fail_severities = set()
         for s in self.fail_on:
             try:
@@ -198,13 +166,14 @@ class ScanPipeline:
                 pass
 
         has_fail_severity = any(
-            f.severity in fail_severities for f in snapshot.findings
+            sig.severity in fail_severities for sig in assessment.signals
         )
         if has_fail_severity:
             return 2
 
         threshold = self.thresholds.get("overall_score", 0)
-        if snapshot.score < threshold:
+        if assessment.score < threshold:
             return 1
 
         return 0
+

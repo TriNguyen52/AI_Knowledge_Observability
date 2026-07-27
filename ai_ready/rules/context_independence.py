@@ -1,12 +1,12 @@
-"""Context Independence rule — detect chunks that cannot stand alone when retrieved."""
+"""Context Independence collector — detect chunks that cannot stand alone when retrieved."""
 
 from __future__ import annotations
 
 import re
 from typing import Any
 
-from ai_ready.models import Finding, KnowledgeBase, RuleResult, Severity
-from ai_ready.rules import Rule, register_rule
+from ai_ready.models import ArtifactBundle, CollectorResult, KnowledgeSignal, Severity
+from ai_ready.rules import SignalCollector, register_collector
 
 # Patterns that indicate dangling references
 DANGLING_PATTERNS = [
@@ -39,19 +39,19 @@ UNDEFINED_ENTITY_PATTERNS = [
 ]
 
 
-@register_rule
-class ContextIndependenceRule(Rule):
+@register_collector
+class ContextIndependenceCollector(SignalCollector):
     """Detect paragraphs that reference content outside themselves."""
 
     id = "context_independence"
     severity_default = Severity.MEDIUM
     dimension = "context"
 
-    def collect(self, kb: KnowledgeBase) -> dict[str, Any]:
+    def collect(self, bundle: ArtifactBundle) -> dict[str, Any]:
         """Scan all paragraphs for dangling references."""
         results: list[dict[str, Any]] = []
-        for doc in kb.documents:
-            for i, para in enumerate(doc.paragraphs):
+        for artifact in bundle.artifacts:
+            for i, para in enumerate(artifact.paragraphs):
                 text_lower = para.text.lower()
                 dangling: list[dict[str, str]] = []
 
@@ -75,8 +75,8 @@ class ContextIndependenceRule(Rule):
 
                 if dangling:
                     results.append({
-                        "doc_id": doc.id,
-                        "doc_path": doc.path,
+                        "doc_id": artifact.id,
+                        "doc_path": artifact.uri,
                         "paragraph_index": i,
                         "paragraph_text": para.text[:200],
                         "section_heading": para.section_heading,
@@ -87,7 +87,7 @@ class ContextIndependenceRule(Rule):
         return {"paragraph_issues": results}
 
     def measure(self, signals: dict[str, Any]) -> dict[str, Any]:
-        """Count dangling references per document."""
+        """Count dangling references per artifact."""
         doc_counts: dict[str, dict[str, Any]] = {}
         for issue in signals["paragraph_issues"]:
             doc_id = issue["doc_id"]
@@ -104,22 +104,22 @@ class ContextIndependenceRule(Rule):
 
         return {"doc_counts": list(doc_counts.values())}
 
-    def evaluate(self, metrics: dict[str, Any]) -> list[Finding]:
-        """Flag documents with dangling references.
+    def evaluate(self, metrics: dict[str, Any]) -> list[KnowledgeSignal]:
+        """Flag artifacts with dangling references.
 
-        Emits bare findings with issue_type only. Severity, score, and
-        recommendation are assigned by the EvaluationPolicy in the pipeline.
+        Emits bare signals with signal_type only. Severity, score, and
+        recommendation are assigned by the InterpretationPolicy in the pipeline.
         """
-        findings: list[Finding] = []
+        signals: list[KnowledgeSignal] = []
         for dc in metrics["doc_counts"]:
             if dc["dangling_count"] > 0:
-                findings.append(Finding(
-                    rule_id=self.id,
-                    issue_type="dangling_reference",
+                signals.append(KnowledgeSignal(
+                    collector_id=self.id,
+                    signal_type="dangling_reference",
                     severity=Severity.LOW,  # Placeholder; overridden by policy
                     score=0,  # Placeholder; overridden by policy
-                    document_id=dc["doc_id"],
-                    document_path=dc["doc_path"],
+                    artifact_id=dc["doc_id"],
+                    artifact_uri=dc["doc_path"],
                     evidence={
                         "dangling_reference_count": dc["dangling_count"],
                         "issues": [
@@ -134,23 +134,23 @@ class ContextIndependenceRule(Rule):
                     },
                     recommendation="",  # Filled by policy
                 ))
-        return findings
+        return signals
 
-    def report(self) -> RuleResult:
-        findings = self._findings
-        total_dangling = sum(f.evidence.get("dangling_reference_count", 0) for f in findings)
+    def report(self) -> CollectorResult:
+        signals = self._findings
+        total_dangling = sum(s.evidence.get("dangling_reference_count", 0) for s in signals)
 
-        score = max(0, 100 - len(findings) * 10)
-        severity = Severity.MEDIUM if findings else Severity.LOW
+        score = max(0, 100 - len(signals) * 10)
+        severity = Severity.MEDIUM if signals else Severity.LOW
 
-        return RuleResult(
-            rule_id=self.id,
+        return CollectorResult(
+            collector_id=self.id,
             score=score,
             severity=severity,
             metrics={
                 "total_dangling_references": total_dangling,
-                "flagged_documents": len(findings),
+                "flagged_documents": len(signals),
             },
-            findings=findings,
-            recommendation=f"{total_dangling} dangling references across {len(findings)} documents" if findings else "All paragraphs are self-contained",
+            signals=signals,
+            recommendation=f"{total_dangling} dangling references across {len(signals)} artifacts" if signals else "All paragraphs are self-contained",
         )

@@ -1,19 +1,34 @@
-"""Rule engine base class and registry."""
+"""Signal collector base class and registry.
+
+A SignalCollector implements the collect -> measure -> evaluate -> report
+pipeline and emits bare signals (facts without interpretation). The
+assessment layer enriches signals with severity, score, and recommendation
+via InterpretationPolicy.
+"""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Any
 
-from ai_ready.models import Document, Finding, KnowledgeBase, RuleResult, Severity
+from ai_ready.models import (
+    ArtifactBundle,
+    CollectorResult,
+    KnowledgeArtifact,
+    KnowledgeSignal,
+    Severity,
+)
 
 
-class Rule(ABC):
-    """Base rule contract - every rule implements collect/measure/evaluate/report.
+class SignalCollector(ABC):
+    """Base collector contract — every collector implements collect/measure/evaluate/report.
 
-    Rules receive a KnowledgeBase (documents + relations) instead of a raw
-    list of documents. This allows rules to access document relationships
+    Collectors receive an ArtifactBundle (artifacts + relationships) instead of a raw
+    list of documents. This allows collectors to access artifact relationships
     (navigation hierarchy, cross-references) for richer analysis.
+
+    The pipeline produces signals (bare facts) that are later interpreted by
+    the assessment layer via InterpretationPolicy.
     """
 
     id: str = "base"
@@ -21,8 +36,8 @@ class Rule(ABC):
     dimension: str = "retrieval"
 
     @abstractmethod
-    def collect(self, kb: KnowledgeBase) -> dict[str, Any]:
-        """Collect raw signals from the knowledge base."""
+    def collect(self, bundle: ArtifactBundle) -> dict[str, Any]:
+        """Collect raw signals from the artifact bundle."""
         ...
 
     @abstractmethod
@@ -31,51 +46,51 @@ class Rule(ABC):
         ...
 
     @abstractmethod
-    def evaluate(self, metrics: dict[str, Any]) -> list[Finding]:
-        """Evaluate metrics and produce findings."""
+    def evaluate(self, metrics: dict[str, Any]) -> list[KnowledgeSignal]:
+        """Evaluate metrics and produce signals."""
         ...
 
     @abstractmethod
-    def report(self) -> RuleResult:
-        """Produce the final rule result."""
+    def report(self) -> CollectorResult:
+        """Produce the final collector result."""
         ...
 
-    def run(self, kb: KnowledgeBase) -> RuleResult:
+    def run(self, bundle: ArtifactBundle) -> CollectorResult:
         """Execute the full collect -> measure -> evaluate -> report pipeline."""
-        self._kb = kb
-        self._signals = self.collect(kb)
+        self._bundle = bundle
+        self._signals = self.collect(bundle)
         self._metrics = self.measure(self._signals)
         self._findings = self.evaluate(self._metrics)
         return self.report()
 
     @property
-    def documents(self) -> list[Document]:
-        """Convenience accessor for the documents in the knowledge base."""
-        return self._kb.documents if hasattr(self, "_kb") else []
+    def artifacts(self) -> list[KnowledgeArtifact]:
+        """Convenience accessor for the artifacts in the bundle."""
+        return self._bundle.artifacts if hasattr(self, "_bundle") else []
 
 
-# Registry of all available rules
-_RULE_REGISTRY: dict[str, type[Rule]] = {}
+# Registry of all available collectors
+_COLLECTOR_REGISTRY: dict[str, type[SignalCollector]] = {}
 
 
-def register_rule(rule_class: type[Rule]) -> type[Rule]:
-    """Decorator to register a rule class."""
-    _RULE_REGISTRY[rule_class.id] = rule_class
-    return rule_class
+def register_collector(collector_class: type[SignalCollector]) -> type[SignalCollector]:
+    """Decorator to register a collector class."""
+    _COLLECTOR_REGISTRY[collector_class.id] = collector_class
+    return collector_class
 
 
-def get_rule(rule_id: str) -> type[Rule] | None:
-    """Look up a rule class by ID."""
-    return _RULE_REGISTRY.get(rule_id)
+def get_collector(collector_id: str) -> type[SignalCollector] | None:
+    """Look up a collector class by ID."""
+    return _COLLECTOR_REGISTRY.get(collector_id)
 
 
-def all_rules() -> dict[str, type[Rule]]:
-    """Return all registered rules."""
-    return dict(_RULE_REGISTRY)
+def all_collectors() -> dict[str, type[SignalCollector]]:
+    """Return all registered collectors."""
+    return dict(_COLLECTOR_REGISTRY)
 
 
-# Dimension -> rule mapping
-DIMENSION_RULES: dict[str, list[str]] = {
+# Dimension -> collector mapping
+DIMENSION_COLLECTORS: dict[str, list[str]] = {
     "retrieval": ["topic_purity", "heading_quality"],
     "context": ["context_independence"],
     "consistency": ["terminology_consistency", "contradiction_detection"],
@@ -85,9 +100,9 @@ DIMENSION_RULES: dict[str, list[str]] = {
 }
 
 
-# Auto-import all rule modules to trigger @register_rule decorators
-def _import_rules() -> None:
-    """Import all rule modules to register them."""
+# Auto-import all collector modules to trigger @register_collector decorators
+def _import_collectors() -> None:
+    """Import all collector modules to register them."""
     import importlib
     import pkgutil
 
@@ -96,5 +111,11 @@ def _import_rules() -> None:
             continue
         importlib.import_module(f"{__name__}.{module_info.name}")
 
+_import_collectors()
 
-_import_rules()
+
+# Re-export collector classes for convenient access.
+from ai_ready.rules.topic_purity import TopicPurityCollector  # noqa: E402, F401
+from ai_ready.rules.heading_quality import HeadingQualityCollector  # noqa: E402, F401
+from ai_ready.rules.context_independence import ContextIndependenceCollector  # noqa: E402, F401
+from ai_ready.rules.link_integrity import LinkIntegrityCollector  # noqa: E402, F401

@@ -1,4 +1,4 @@
-"""Topic Purity rule — detect documents containing multiple unrelated concepts."""
+"""Topic Purity collector — detect artifacts containing multiple unrelated concepts."""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ import math
 from collections import Counter
 from typing import Any
 
-from ai_ready.models import Finding, KnowledgeBase, RuleResult, Severity
-from ai_ready.rules import Rule, register_rule
+from ai_ready.models import ArtifactBundle, CollectorResult, KnowledgeSignal, Severity
+from ai_ready.rules import SignalCollector, register_collector
 
 
-@register_rule
-class TopicPurityRule(Rule):
-    """Detect documents that mix unrelated topics via heading clustering."""
+@register_collector
+class TopicPurityCollector(SignalCollector):
+    """Detect artifacts that mix unrelated topics via heading clustering."""
 
     id = "topic_purity"
     severity_default = Severity.HIGH
@@ -35,22 +35,22 @@ class TopicPurityRule(Rule):
         "their", "we", "us", "our", "you", "your", "he", "she", "his", "her",
     }
 
-    def collect(self, kb: KnowledgeBase) -> dict[str, Any]:
-        """Extract heading groups and their keyword sets from each document."""
+    def collect(self, bundle: ArtifactBundle) -> dict[str, Any]:
+        """Extract heading groups and their keyword sets from each artifact."""
         doc_topics: list[dict[str, Any]] = []
-        for doc in kb.documents:
-            if len(doc.headings) < 2:
-                doc_topics.append({"doc_id": doc.id, "doc_path": doc.path, "clusters": [], "title": doc.title})
+        for artifact in bundle.artifacts:
+            if len(artifact.headings) < 2:
+                doc_topics.append({"doc_id": artifact.id, "doc_path": artifact.uri, "clusters": [], "title": artifact.title})
                 continue
 
             # Determine the minimum heading level (the top-level heading)
-            min_level = min(h.level for h in doc.headings)
+            min_level = min(h.level for h in artifact.headings)
 
             # Group headings by top-level heading
             clusters: list[dict[str, Any]] = []
             current_cluster: dict[str, Any] | None = None
 
-            for heading in doc.headings:
+            for heading in artifact.headings:
                 if heading.level == min_level:
                     if current_cluster:
                         clusters.append(current_cluster)
@@ -67,15 +67,15 @@ class TopicPurityRule(Rule):
                 clusters.append(current_cluster)
 
             doc_topics.append({
-                "doc_id": doc.id,
-                "doc_path": doc.path,
-                "title": doc.title,
+                "doc_id": artifact.id,
+                "doc_path": artifact.uri,
+                "title": artifact.title,
                 "clusters": clusters,
             })
         return {"doc_topics": doc_topics}
 
     def measure(self, signals: dict[str, Any]) -> dict[str, Any]:
-        """Compute cluster count, largest cluster ratio, and topic entropy per doc."""
+        """Compute cluster count, largest cluster ratio, and topic entropy per artifact."""
         results: list[dict[str, Any]] = []
         for doc_info in signals["doc_topics"]:
             clusters = doc_info["clusters"]
@@ -128,23 +128,23 @@ class TopicPurityRule(Rule):
 
         return {"doc_metrics": results}
 
-    def evaluate(self, metrics: dict[str, Any]) -> list[Finding]:
-        """Flag documents with multiple unrelated clusters.
+    def evaluate(self, metrics: dict[str, Any]) -> list[KnowledgeSignal]:
+        """Flag artifacts with multiple unrelated clusters.
 
-        Emits bare findings with issue_type only. Severity, score, and
-        recommendation are assigned by the EvaluationPolicy in the pipeline.
+        Emits bare signals with signal_type only. Severity, score, and
+        recommendation are assigned by the InterpretationPolicy in the pipeline.
         """
-        findings: list[Finding] = []
+        signals: list[KnowledgeSignal] = []
         for dm in metrics["doc_metrics"]:
             if dm["cluster_count"] > 1 and dm["largest_cluster_ratio"] < 0.7:
                 cluster_names = [c["heading"] for c in dm["clusters"]]
-                findings.append(Finding(
-                    rule_id=self.id,
-                    issue_type="mixed_topics",
+                signals.append(KnowledgeSignal(
+                    collector_id=self.id,
+                    signal_type="mixed_topics",
                     severity=Severity.LOW,  # Placeholder; overridden by policy
                     score=0,  # Placeholder; overridden by policy
-                    document_id=dm["doc_id"],
-                    document_path=dm["doc_path"],
+                    artifact_id=dm["doc_id"],
+                    artifact_uri=dm["doc_path"],
                     evidence={
                         "cluster_count": dm["cluster_count"],
                         "largest_cluster_ratio": round(dm["largest_cluster_ratio"], 3),
@@ -153,35 +153,35 @@ class TopicPurityRule(Rule):
                     },
                     recommendation="",  # Filled by policy
                 ))
-        return findings
+        return signals
 
-    def report(self) -> RuleResult:
+    def report(self) -> CollectorResult:
         """Produce final result.
 
         Score and severity are placeholders; the pipeline recomputes them
-        from policy-assessed findings during aggregation.
+        from policy-assessed signals during aggregation.
         """
-        findings = self._findings
+        signals = self._findings
         metrics = self._metrics
 
         all_docs = metrics.get("doc_metrics", [])
         total_entropy = sum(d.get("topic_entropy", 0) for d in all_docs)
         avg_entropy = total_entropy / len(all_docs) if all_docs else 0
 
-        score = max(0, 100 - len(findings) * 15 - int(avg_entropy * 10))
-        severity = Severity.HIGH if findings else Severity.LOW
+        score = max(0, 100 - len(signals) * 15 - int(avg_entropy * 10))
+        severity = Severity.HIGH if signals else Severity.LOW
 
-        return RuleResult(
-            rule_id=self.id,
+        return CollectorResult(
+            collector_id=self.id,
             score=score,
             severity=severity,
             metrics={
                 "total_documents": len(all_docs),
-                "flagged_documents": len(findings),
+                "flagged_documents": len(signals),
                 "avg_topic_entropy": round(avg_entropy, 3),
             },
-            findings=findings,
-            recommendation=f"{len(findings)} documents have mixed topics" if findings else "All documents are topically focused",
+            signals=signals,
+            recommendation=f"{len(signals)} artifacts have mixed topics" if signals else "All artifacts are topically focused",
         )
 
     def _extract_keywords(self, text: str) -> set[str]:

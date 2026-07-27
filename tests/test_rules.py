@@ -315,7 +315,7 @@ def test_policy_enriches_findings():
 
     # Apply policy
     pipeline = ScanPipeline()
-    pipeline._apply_policy(result.findings)
+    pipeline.apply_policy(result.findings)
 
     # After policy: severity from policy registry
     assert result.findings[0].severity == Severity.CRITICAL
@@ -375,3 +375,32 @@ def test_pipeline_enriches_findings_end_to_end():
         assert f.severity != Severity.LOW or f.issue_type == "orphan", (
             f"Finding {f.finding_id} unexpectedly LOW severity"
         )
+
+
+def test_collector_aliases_are_rule_classes():
+    """Collector aliases should be the same class objects as their Rule counterparts."""
+    from ai_ready.rules.topic_purity import TopicPurityCollector, TopicPurityRule
+    from ai_ready.rules.heading_quality import HeadingQualityCollector, HeadingQualityRule
+    from ai_ready.rules.context_independence import ContextIndependenceCollector, ContextIndependenceRule
+    from ai_ready.rules.link_integrity import LinkIntegrityCollector, LinkIntegrityRule
+
+    assert TopicPurityCollector is TopicPurityRule
+    assert HeadingQualityCollector is HeadingQualityRule
+    assert ContextIndependenceCollector is ContextIndependenceRule
+    assert LinkIntegrityCollector is LinkIntegrityRule
+
+
+def test_collector_aliases_accessible_from_rules_init():
+    """Collector aliases should be importable from ai_ready.rules."""
+    from ai_ready.rules import (
+        TopicPurityCollector,
+        HeadingQualityCollector,
+        ContextIndependenceCollector,
+        LinkIntegrityCollector,
+    )
+
+    # Verify they're usable (can be instantiated)
+    assert TopicPurityCollector.id == "topic_purity"
+    assert HeadingQualityCollector.id == "heading_quality"
+    assert ContextIndependenceCollector.id == "context_independence"
+    assert LinkIntegrityCollector.id == "link_integrity"
