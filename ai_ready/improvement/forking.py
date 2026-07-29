@@ -58,6 +58,7 @@ def fork_from_proposal(
     enable_otel: bool = False,
     project_name: str = "ai_ready_improvement",
     partition_key: str | None = None,
+    diagnosis_quality_tracker: Any = None,
 ) -> Any:
     """Fork a failed improvement workflow from the proposal generation step.
 
@@ -124,29 +125,30 @@ def fork_from_proposal(
         remediation_id=f"{prior_state.get('remediation_id', 'unknown')}_fork_{attempt_number}",
         assessment_id=prior_state.get("assessment_id", ""),
         signal_ids=prior_state.get("signal_ids", []),
-        affected_artifact_ids=prior_state.get("affected_artifact_ids", []),
         affected_artifact_uris=prior_state.get("affected_artifact_uris", []),
         prior_failures=prior_failures,
     )
 
     # Carry forward root cause analysis — we don't need to re-analyze
     new_state["root_cause_analysis"] = prior_state.get("root_cause_analysis", [])
-    # Focus 3: Carry forward knowledge problems, prior diagnosis, strategy,
+    # Carry forward knowledge problems, prior diagnosis, strategy,
     # verification, and execution so the forked retry can reason about why
     # the prior attempt failed and generate a genuinely different strategy
     new_state["knowledge_problems"] = prior_state.get("knowledge_problems", [])
     new_state["prior_diagnosis"] = prior_state.get("prior_diagnosis", {})
     new_state["prior_strategy"] = prior_state.get("prior_strategy", {})
     new_state["prior_verification"] = prior_state.get("prior_verification", {})
-    new_state["prior_execution"] = prior_state.get("prior_execution", [])
     # Carry forward decision trace so reasoning accumulates across forks
     new_state["decision_trace"] = prior_state.get("decision_trace", {})
-    # Obj 2, 9: Carry forward assessment summary and cumulative tokens
+    # Carry forward assessment summary and cumulative tokens
     new_state["assessment_summary"] = prior_state.get("assessment_summary", "")
     new_state["cumulative_tokens"] = prior_state.get("cumulative_tokens", 0)
+    # Carry forward signal-delta and salience state
+    new_state["last_analysis_signal_ids"] = prior_state.get("last_analysis_signal_ids", [])
+    new_state["skip_events"] = prior_state.get("skip_events", [])
+    new_state["problem_saliences"] = prior_state.get("problem_saliences", [])
     new_state["attempt_number"] = attempt_number
     new_state["forked_from_app_id"] = prior_app_id
-    new_state["forked_from_sequence_id"] = prior_sequence_id
     new_state["current_stage"] = RemediationStatus.ROOT_CAUSE_FOUND.value
 
     # Build the graph and application
@@ -188,71 +190,10 @@ def fork_from_proposal(
         "relationships": relationships,
         "source": source,
         "git_commit": git_commit,
+        "diagnosis_quality_tracker": diagnosis_quality_tracker,
     })
 
     return app
-
-
-def _strategy_similarity(strategy_a: str, strategy_b: str) -> float:
-    """Compute a simple similarity score between two strategy names.
-
-    Objective 6: Prevent retrying the same strategy under a different name.
-    Uses token overlap (Jaccard similarity) on lowercased words.
-
-    Returns:
-        Similarity score from 0.0 (completely different) to 1.0 (identical).
-    """
-    if not strategy_a or not strategy_b:
-        return 0.0
-    # Normalize: lowercase, replace underscores and hyphens with spaces
-    tokens_a = set(strategy_a.lower().replace("_", " ").replace("-", " ").split())
-    tokens_b = set(strategy_b.lower().replace("_", " ").replace("-", " ").split())
-    if not tokens_a or not tokens_b:
-        return 0.0
-    intersection = tokens_a & tokens_b
-    union = tokens_a | tokens_b
-    return len(intersection) / len(union)
-
-
-def validate_fork_strategy(
-    new_strategy: str,
-    prior_failures: list[dict[str, Any]],
-    similarity_threshold: float = 0.7,
-) -> tuple[bool, str]:
-    """Validate that a forked retry strategy is genuinely different.
-
-    Objective 6: Prevents retrying the same strategy under a different name.
-    Compares the new strategy against all prior failed strategies using
-    token overlap similarity. If any prior strategy is too similar,
-    the fork should be rejected.
-
-    Args:
-        new_strategy: The strategy name from the new proposal.
-        prior_failures: List of prior failure summaries with 'strategy' keys.
-        similarity_threshold: Max allowed similarity (0.0 to 1.0).
-            Default 0.7 means strategies sharing 70%+ of words are rejected.
-
-    Returns:
-        Tuple of (is_valid, explanation). is_valid is True if the strategy
-        is sufficiently different from all prior failures.
-    """
-    if not prior_failures:
-        return True, "No prior failures to compare against."
-
-    for failure in prior_failures:
-        prior_strategy = failure.get("strategy", "")
-        if not prior_strategy:
-            continue
-        similarity = _strategy_similarity(new_strategy, prior_strategy)
-        if similarity >= similarity_threshold:
-            return False, (
-                f"Strategy '{new_strategy}' is too similar to prior failed "
-                f"strategy '{prior_strategy}' (similarity={similarity:.2f}, "
-                f"threshold={similarity_threshold}). Never retry the same "
-                f"strategy under a different name."
-            )
-
-    return True, f"Strategy '{new_strategy}' is sufficiently different from all prior failures."
 
 
 def should_fork(state: dict[str, Any], max_attempts: int = 3) -> bool:
@@ -291,48 +232,3 @@ def should_fork(state: dict[str, Any], max_attempts: int = 3) -> bool:
         return True
 
     return False
-
-
-def get_fork_sequence_id(tracker: Any, app_id: str, action_name: str = "generate_proposal") -> int:
-    """Get the sequence_id of a specific action from a prior workflow.
-
-    Uses Burr's tracking client to find the sequence_id of the
-    generate_proposal step in the prior workflow.
-
-    Args:
-        tracker: Burr LocalTrackingClient instance.
-        app_id: The prior application ID.
-        action_name: The action to find (default: "generate_proposal").
-
-    Returns:
-        The sequence_id of the action, or -1 if not found.
-    """
-    # This requires accessing Burr's tracking data
-    # The exact API depends on the Burr version
-    try:
-        # Burr stores tracking data in ~/.burr/<project>/
-        # The load API can retrieve prior state
-        import json
-        from pathlib import Path
-
-        # Try to find the tracking data
-        tracking_dir = Path.home() / ".burr"
-        if tracker and hasattr(tracker, 'project'):
-            tracking_dir = tracking_dir / tracker.project
-
-        # Search for the app's state log
-        # The exact path structure may vary by Burr version
-        for state_file in tracking_dir.rglob("*.json"):
-            try:
-                data = json.loads(state_file.read_text())
-                if isinstance(data, list):
-                    for entry in data:
-                        if (entry.get("app_id") == app_id and
-                            entry.get("action") == action_name):
-                            return entry.get("sequence_id", -1)
-            except (json.JSONDecodeError, KeyError):
-                continue
-    except Exception as e:
-        logger.warning(f"Could not retrieve fork sequence_id: {e}")
-
-    return -1

@@ -459,7 +459,6 @@ try:
         has_references_only = (
             "assessment_id" in state_keys
             and "signal_ids" in state_keys
-            and "affected_artifact_ids" in state_keys
             and "affected_artifact_uris" in state_keys
         )
         state_size = len(json.dumps(final_state, default=str))

@@ -48,8 +48,10 @@ from ai_ready.improvement.application import (
     approve_and_run,
 )
 from ai_ready.improvement.forking import fork_from_proposal, should_fork
-from ai_ready.improvement.history import ImprovementHistoryStore
+from ai_ready.improvement.history import ImprovementHistoryStore, OutcomeEMATracker
 from ai_ready.improvement.test_generation import generate_test
+from ai_ready.improvement.diagnosis_quality import DiagnosisQualityTracker
+from ai_ready.improvement.problem_queue import ProblemQueue
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,8 @@ class ImprovementManager:
         enable_tracking: bool = True,
         enable_otel: bool = False,
         max_fork_attempts: int = 3,
+        diagnosis_quality_tracker: Any = None,
+        problem_queue: Any = None,
     ) -> None:
         self.llm_gateway = llm_gateway
         self.assessment_store = assessment_store
@@ -101,6 +105,27 @@ class ImprovementManager:
             self.history_store = ImprovementHistoryStore(history_db_path)
         else:
             self.history_store = None
+
+        # Initialize diagnosis quality tracker if not provided
+        if diagnosis_quality_tracker:
+            self.diagnosis_quality_tracker = diagnosis_quality_tracker
+        elif history_db_path:
+            dq_path = history_db_path.replace(".db", "_diagnosis_quality.db")
+            self.diagnosis_quality_tracker = DiagnosisQualityTracker(db_path=dq_path)
+        else:
+            self.diagnosis_quality_tracker = None
+
+        # Initialize problem queue if not provided
+        if problem_queue:
+            self.problem_queue = problem_queue
+        elif history_db_path:
+            pq_path = history_db_path.replace(".db", "_problem_queue.db")
+            self.problem_queue = ProblemQueue(
+                history_store=self.history_store,
+                db_path=pq_path,
+            )
+        else:
+            self.problem_queue = None
 
         # Track active applications
         self._apps: dict[str, Any] = {}
@@ -132,15 +157,11 @@ class ImprovementManager:
             artifact_uris = list({s.artifact_uri for s in assessment.signals
                                   if s.signal_id in signal_ids})
 
-        artifact_ids = list({s.artifact_id for s in assessment.signals
-                             if s.signal_id in signal_ids})
-
         # Create initial state
         state_dict = initial_state(
             remediation_id=remediation_id,
             assessment_id=assessment_id,
             signal_ids=signal_ids,
-            affected_artifact_ids=artifact_ids,
             affected_artifact_uris=artifact_uris,
         )
 
@@ -158,6 +179,7 @@ class ImprovementManager:
             git_commit=self.git_commit,
             enable_tracking=self.enable_tracking,
             enable_otel=self.enable_otel,
+            diagnosis_quality_tracker=self.diagnosis_quality_tracker,
         )
 
         app_id = app.uid
@@ -260,6 +282,7 @@ class ImprovementManager:
             git_commit=self.git_commit,
             enable_tracking=self.enable_tracking,
             enable_otel=self.enable_otel,
+            diagnosis_quality_tracker=self.diagnosis_quality_tracker,
         )
 
         new_app_id = app.uid
@@ -273,7 +296,7 @@ class ImprovementManager:
     def _record_outcome(self, app_id: str, state: dict[str, Any]) -> None:
         """Record the workflow outcome in the history store.
 
-        Focus 6: Records the new fields (verification_outcome,
+        Records the new fields (verification_outcome,
         strategy_description, proposal_reasoning) so that future
         workflows can use richer historical context.
         """
@@ -305,7 +328,7 @@ class ImprovementManager:
         attempt_number = state.get("attempt_number", 1)
         forked_from = state.get("forked_from_app_id", "")
 
-        # Focus 6: New fields for richer history
+        # New fields for richer history
         verification_outcome = verification.get("overall_outcome", "")
         strategy_description = (
             proposals[selected_idx].get("description", "")
@@ -379,7 +402,7 @@ class ImprovementManager:
         return state
 
     def get_metrics(self) -> dict[str, Any]:
-        """Get aggregate remediation quality metrics (Focus 6).
+        """Get aggregate remediation quality metrics.
 
         Returns metrics showing whether AI-Ready is becoming more
         effective at resolving Knowledge Problems over time:
@@ -398,7 +421,7 @@ class ImprovementManager:
         return self.history_store.get_remediation_metrics()
 
     def get_decision_trace(self, app_id: str) -> dict[str, Any]:
-        """Get the full decision trace for a workflow (Focus 7).
+        """Get the full decision trace for a workflow.
 
         Returns the explainability chain showing reasoning at each stage:
         Knowledge Problems → Evidence → Root Cause → Historical Context →
@@ -411,3 +434,147 @@ class ImprovementManager:
             DecisionTrace dict, or empty dict if not available.
         """
         return self.get_state(app_id).get("decision_trace", {})
+
+    def get_diagnosis_quality(self) -> dict[str, Any]:
+        """Get the diagnosis quality report (quantitative feedback loop).
+
+        Returns the correlation between diagnosis confidence and
+        verification outcomes, along with status and calibration
+        adjustment text. All deterministic — no LLM.
+
+        Returns:
+            DiagnosisQualityReport dict, or empty dict if no tracker.
+        """
+        if self.diagnosis_quality_tracker is None:
+            return {}
+        return self.diagnosis_quality_tracker.get_report().to_dict()
+
+    def get_strategy_ema(self, issue_type: str) -> dict[str, Any]:
+        """Get EMA-based strategy success probabilities (deterministic).
+
+        Returns the exponential moving average of success rates per
+        strategy for the given issue type. Recent outcomes weigh more
+        than old ones. Includes diversity floor enforcement.
+
+        Args:
+            issue_type: The root cause category to query.
+
+        Returns:
+            StrategyEMAReport dict, or empty dict if no history store.
+        """
+        if self.history_store is None:
+            return {}
+        tracker = OutcomeEMATracker(self.history_store)
+        return tracker.get_ema_report(issue_type).to_dict()
+
+    def discover_problems(
+        self,
+        assessment: Any,
+        signal_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Discover and queue problems from an assessment (deterministic, no LLM).
+
+        Runs heuristic problem discovery and salience ranking on the
+        assessment's signals. New problems are added to the persistent
+        queue; existing problems are updated with fresh salience scores.
+
+        Args:
+            assessment: The KnowledgeAssessment to analyze.
+            signal_ids: Optional list of signal IDs to focus on.
+                If None, all signals in the assessment are used.
+
+        Returns:
+            List of problem queue entry dicts that were added or updated.
+        """
+        if self.problem_queue is None:
+            return []
+        entries = self.problem_queue.update(assessment, signal_ids)
+        return [e.to_dict() for e in entries]
+
+    def get_problem_queue(
+        self,
+        limit: int = 20,
+        status: str = "open",
+        category: str | None = None,
+        min_salience: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get the ranked problem queue (deterministic, no LLM).
+
+        Returns problems sorted by salience (descending). The queue
+        is continuously updated by discover_problems() and persists
+        across assessments.
+
+        Args:
+            limit: Maximum number of problems to return.
+            status: Filter by status ("open", "in_progress", "resolved",
+                "wont_fix", or "all").
+            category: Optional category filter.
+            min_salience: Optional minimum salience threshold.
+
+        Returns:
+            List of problem queue entry dicts, sorted by salience.
+        """
+        if self.problem_queue is None:
+            return []
+        return self.problem_queue.get_ranked_problems(
+            limit=limit,
+            status=status,
+            category=category,
+            min_salience=min_salience,
+        )
+
+    def get_problem_queue_summary(self) -> dict[str, Any]:
+        """Get a summary of the problem queue (deterministic, no LLM).
+
+        Returns counts by status and category, plus the top 5 most
+        salient open problems.
+
+        Returns:
+            Summary dict with counts and top problems.
+        """
+        if self.problem_queue is None:
+            return {}
+        return self.problem_queue.get_queue_summary()
+
+    def set_problem_status(self, problem_id: str, status: str) -> bool:
+        """Update the status of a problem in the queue.
+
+        Args:
+            problem_id: The problem ID to update.
+            status: New status ("open", "in_progress", "resolved", "wont_fix").
+
+        Returns:
+            True if the problem was found and updated, False otherwise.
+        """
+        if self.problem_queue is None:
+            return False
+        return self.problem_queue.set_status(problem_id, status)
+
+    def get_skip_events(self, app_id: str) -> list[dict[str, Any]]:
+        """Get skip events for a workflow (transparency records).
+
+        Returns the list of decisions NOT to act, with reasons.
+        Includes signal-delta skips and low-salience problem skips.
+
+        Args:
+            app_id: The app_id of the workflow.
+
+        Returns:
+            List of SkipEvent dicts.
+        """
+        return self.get_state(app_id).get("skip_events", [])
+
+    def get_problem_saliences(self, app_id: str) -> list[dict[str, Any]]:
+        """Get the salience scores for problems in a workflow.
+
+        Returns the quantitative ranking of knowledge problems by
+        salience, with full decomposition (encoding, outcome,
+        retrieval, size_penalty).
+
+        Args:
+            app_id: The app_id of the workflow.
+
+        Returns:
+            List of ProblemSalience dicts.
+        """
+        return self.get_state(app_id).get("problem_saliences", [])

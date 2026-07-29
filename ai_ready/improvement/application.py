@@ -111,6 +111,7 @@ def create_improvement_app(
     project_name: str = "ai_ready_improvement",
     app_id: str | None = None,
     partition_key: str | None = None,
+    diagnosis_quality_tracker: Any = None,
 ) -> Any:
     """Create a Burr Application for the improvement workflow.
 
@@ -183,6 +184,7 @@ def create_improvement_app(
         "relationships": relationships,
         "source": source,
         "git_commit": git_commit,
+        "diagnosis_quality_tracker": diagnosis_quality_tracker,
     })
 
     return app
@@ -227,7 +229,6 @@ def run_until_approval(app: Any) -> dict[str, Any]:
             break
 
     return dict(app.state)
-
 def approve_and_run(app: Any, approved: bool, reason: str = "") -> dict[str, Any]:
     """Set approval status and run the rest of the workflow.
 
@@ -256,29 +257,4 @@ def approve_and_run(app: Any, approved: bool, reason: str = "") -> dict[str, Any
 
     return dict(app.state)
 
-def run_full_workflow(app: Any, auto_approve: bool = False) -> dict[str, Any]:
-    """Run the complete improvement workflow.
 
-    If auto_approve is True, the workflow runs without pausing for
-    human approval (useful for testing/dry-run mode).
-
-    Args:
-        app: The Burr application.
-        auto_approve: Skip the approval checkpoint.
-
-    Returns:
-        Final state dict.
-    """
-    if auto_approve:
-        # Patch: set approval_status before the approval action runs
-        # by running in two phases
-        # Phase 1: run until approval
-        state = run_until_approval(app)
-
-        if state.get("current_stage") == RemediationStatus.WAITING_FOR_APPROVAL.value:
-            # Phase 2: auto-approve and continue
-            state = approve_and_run(app, approved=True, reason="auto-approved (dry-run)")
-        return state
-    else:
-        # Just run until approval — caller must resume
-        return run_until_approval(app)

@@ -42,7 +42,7 @@ scan_phase2.py
 scan_summary.py
 fastapi_scan.json
 fetch_reddit.py
-
+_audit_state.py
 # Documents
 docs
 tests
@@ -51,7 +51,5 @@ tests
 .env
 
 # Data
-baseline.db
-generated_tests
-improvement_history.db
+*.db
 validation_results.json

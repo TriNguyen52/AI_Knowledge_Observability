@@ -14,11 +14,195 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from ai_ready.improvement.models import RemediationOutcome
+
+
+# ---------------------------------------------------------------------------
+# EMA-based strategy scoring (deterministic, no LLM)
+# ---------------------------------------------------------------------------
+
+DEFAULT_EMA_ALPHA = 0.3       # weight of the most recent observation
+DEFAULT_DIVERSITY_FLOOR = 0.1  # minimum score = 10% of the best strategy's score
+
+
+@dataclass
+class StrategyEMA:
+    """Exponential moving average for a single strategy's success rate.
+
+    Tracks a rolling success probability that weights recent outcomes more
+    heavily than old ones. This implements LTP/LTD for remediation strategies:
+    strategies that succeed get reinforced (LTP), strategies that fail decay
+    (LTD). The diversity floor prevents rare-but-correct strategies from
+    being permanently deprioritized.
+
+    All computation is deterministic — no LLM.
+    """
+
+    strategy: str
+    ema: float = 0.5           # current EMA value (starts at neutral prior)
+    observation_count: int = 0
+    last_outcome: str = ""     # "success" or "failure"
+    last_timestamp: str = ""
+
+    def update(self, outcome: float, timestamp: str = "") -> None:
+        """Update the EMA with a new observation.
+
+        Args:
+            outcome: 1.0 for success, 0.0 for failure, 0.5 for partial.
+            timestamp: ISO timestamp of the observation.
+        """
+        self.ema = DEFAULT_EMA_ALPHA * outcome + (1 - DEFAULT_EMA_ALPHA) * self.ema
+        self.observation_count += 1
+        self.last_outcome = "success" if outcome >= 0.5 else "failure"
+        self.last_timestamp = timestamp
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy": self.strategy,
+            "ema": round(self.ema, 4),
+            "observation_count": self.observation_count,
+            "last_outcome": self.last_outcome,
+            "last_timestamp": self.last_timestamp,
+        }
+
+
+@dataclass
+class StrategyEMAReport:
+    """Aggregated EMA report across all strategies for an issue type.
+
+    Includes diversity floor enforcement and ranking.
+    """
+
+    strategies: list[dict[str, Any]]  # sorted by EMA descending
+    total_observations: int
+    best_strategy: str
+    worst_strategy: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategies": self.strategies,
+            "total_observations": self.total_observations,
+            "best_strategy": self.best_strategy,
+            "worst_strategy": self.worst_strategy,
+        }
+
+
+class OutcomeEMATracker:
+    """Tracks EMA-based success probabilities per strategy.
+
+    Replays all historical outcomes in chronological order to compute
+    the current EMA for each strategy. The diversity floor ensures
+    rare strategies aren't permanently suppressed.
+
+    Usage:
+        tracker = OutcomeEMATracker(history_store)
+        report = tracker.get_ema_report(issue_type="broken_links")
+        # report.strategies[0] -> {"strategy": "add_redirects", "ema": 0.82, ...}
+    """
+
+    def __init__(self, history_store: ImprovementHistoryStore) -> None:
+        self.history_store = history_store
+
+    def get_ema_scores(self, issue_type: str) -> dict[str, StrategyEMA]:
+        """Compute current EMA scores for all strategies of an issue type.
+
+        Replays outcomes chronologically so the EMA reflects the most
+        recent observations.
+
+        Args:
+            issue_type: The root cause category to filter by.
+
+        Returns:
+            Dict mapping strategy name to StrategyEMA.
+        """
+        # Fetch all outcomes for this issue type, oldest first
+        with self.history_store._conn() as conn:
+            rows = conn.execute(
+                """SELECT strategy, result, score_change, timestamp
+                   FROM improvement_outcomes
+                   WHERE issue_type = ?
+                   ORDER BY timestamp ASC""",
+                (issue_type,),
+            ).fetchall()
+
+        ema_map: dict[str, StrategyEMA] = {}
+        for row in rows:
+            strategy = row["strategy"]
+            result = row["result"]
+            timestamp = row["timestamp"]
+
+            if strategy not in ema_map:
+                ema_map[strategy] = StrategyEMA(strategy=strategy)
+
+            # Convert result to numeric outcome
+            if result == "success":
+                outcome = 1.0
+            elif result == "partial":
+                outcome = 0.5
+            else:
+                outcome = 0.0
+
+            ema_map[strategy].update(outcome, timestamp)
+
+        return ema_map
+
+    def get_ema_report(
+        self,
+        issue_type: str,
+        diversity_floor: float = DEFAULT_DIVERSITY_FLOOR,
+    ) -> StrategyEMAReport:
+        """Build a ranked EMA report with diversity floor enforcement.
+
+        The diversity floor ensures that no strategy's EMA drops below
+        `diversity_floor * max_ema`. This prevents strategies with limited
+        history from being permanently deprioritized — they remain visible
+        for future selection.
+
+        Args:
+            issue_type: The root cause category.
+            diversity_floor: Minimum ratio of best strategy's EMA.
+
+        Returns:
+            StrategyEMAReport with strategies sorted by adjusted EMA.
+        """
+        ema_map = self.get_ema_scores(issue_type)
+
+        if not ema_map:
+            return StrategyEMAReport(
+                strategies=[],
+                total_observations=0,
+                best_strategy="",
+                worst_strategy="",
+            )
+
+        # Find max EMA for diversity floor
+        max_ema = max(e.ema for e in ema_map.values())
+        floor = diversity_floor * max_ema
+
+        # Apply diversity floor and sort
+        strategy_list = []
+        for ema in ema_map.values():
+            adjusted = max(ema.ema, floor) if ema.observation_count > 0 else floor
+            entry = ema.to_dict()
+            entry["adjusted_ema"] = round(adjusted, 4)
+            entry["diversity_floor_applied"] = ema.ema < floor
+            strategy_list.append(entry)
+
+        strategy_list.sort(key=lambda x: x["adjusted_ema"], reverse=True)
+
+        total_obs = sum(e.observation_count for e in ema_map.values())
+
+        return StrategyEMAReport(
+            strategies=strategy_list,
+            total_observations=total_obs,
+            best_strategy=strategy_list[0]["strategy"] if strategy_list else "",
+            worst_strategy=strategy_list[-1]["strategy"] if strategy_list else "",
+        )
 
 
 class ImprovementHistoryStore:
@@ -82,7 +266,7 @@ class ImprovementHistoryStore:
                 CREATE INDEX IF NOT EXISTS idx_outcomes_issue_strategy
                 ON improvement_outcomes(issue_type, strategy, result)
             """)
-            # Add columns for richer outcome tracking (Focus 2 & 6)
+            # Add columns for richer outcome tracking
             # Use ALTER TABLE for existing databases
             try:
                 conn.execute("ALTER TABLE improvement_outcomes ADD COLUMN verification_outcome TEXT DEFAULT ''")
@@ -233,7 +417,7 @@ class ImprovementHistoryStore:
         artifact_uris: list[str] | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """Retrieve similar Knowledge Problems from history (Focus 2).
+        """Retrieve similar Knowledge Problems from history.
 
         Finds prior outcomes for the same issue type, optionally filtered
         by overlapping artifact URIs. Used to provide historical context
@@ -281,7 +465,7 @@ class ImprovementHistoryStore:
         issue_type: str,
         artifact_uris: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Build structured historical context for proposal generation (Focus 2 & 5).
+        """Build structured historical context for proposal generation.
 
         Retrieves and organizes prior remediation attempts into a structured
         context that the LLM can use during proposal generation:
@@ -290,6 +474,7 @@ class ImprovementHistoryStore:
         - successful_strategies: what worked
         - failed_strategies: what didn't work and why
         - strategy_stats: success/failure rates per strategy
+        - strategy_ema: EMA-based predicted success probability per strategy
 
         Args:
             issue_type: The root cause category.
@@ -303,16 +488,21 @@ class ImprovementHistoryStore:
         failed = [o for o in similar if o.get("result") == "failure"]
         stats = self.get_strategy_stats(issue_type)
 
+        # EMA-based strategy scoring (deterministic, no LLM)
+        ema_tracker = OutcomeEMATracker(self)
+        ema_report = ema_tracker.get_ema_report(issue_type)
+
         return {
             "similar_problems": similar,
             "successful_strategies": successful,
             "failed_strategies": failed,
             "strategy_stats": stats,
+            "strategy_ema": ema_report.to_dict(),
             "total_prior_attempts": len(similar),
         }
 
     def get_remediation_metrics(self) -> dict[str, Any]:
-        """Compute aggregate remediation quality metrics (Focus 6).
+        """Compute aggregate remediation quality metrics.
 
         Measures whether AI-Ready is becoming more effective over time:
 

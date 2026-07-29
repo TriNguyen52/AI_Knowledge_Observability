@@ -32,215 +32,32 @@ from ai_ready.improvement.models import (
     RemediationProposal,
     VerificationResult,
 )
+from ai_ready.improvement.salience import (
+    check_signal_delta,
+    discover_problems_heuristic,
+    rank_problems_by_salience,
+    SkipEvent,
+    DEFAULT_SALIENCE_THRESHOLD,
+)
+from ai_ready.improvement.diagnosis_quality import DiagnosisQualityTracker
+from ai_ready.improvement.prompts import (
+    build_signal_context,
+    build_artifact_context,
+    build_history_context,
+    cluster_signals,
+    build_assessment_summary,
+)
+from ai_ready.improvement.heuristics import (
+    heuristic_analysis,
+    heuristic_problems,
+    heuristic_proposal,
+    reject_generic_proposals,
+    parse_hypotheses_and_problems,
+    parse_proposals,
+)
 from ai_ready.llm.base import LLMMessage
 
 logger = logging.getLogger(__name__)
-
-
-def _build_signal_context(
-    signal_ids: list[str],
-    assessment_store: Any,
-) -> str:
-    """Build a text summary of signals for the LLM prompt.
-
-    The LLM receives signal descriptions, NOT access to the knowledge base.
-    This is the security boundary — the LLM sees what we show it.
-    """
-    if not assessment_store:
-        return "No assessment store available."
-
-    # Load the latest assessment to get signal details
-    assessment = assessment_store.latest()
-    if not assessment:
-        return "No assessment available."
-
-    lines: list[str] = []
-    for signal in assessment.signals:
-        if signal.signal_id in signal_ids:
-            lines.append(
-                f"- Signal {signal.signal_id}: "
-                f"collector={signal.collector_id}, "
-                f"type={signal.signal_type}, "
-                f"severity={signal.severity.value}, "
-                f"artifact={signal.artifact_uri}, "
-                f"evidence={json.dumps(signal.evidence, default=str)[:200]}, "
-                f"recommendation={signal.recommendation}, "
-                f"ai_impact={signal.ai_impact}"
-            )
-    return "\n".join(lines) if lines else "No matching signals found."
-
-
-def _build_artifact_context(
-    artifact_uris: list[str],
-    assessment_store: Any,
-) -> str:
-    """Build a text summary of affected artifacts for the LLM prompt."""
-    if not assessment_store:
-        return "No assessment store available."
-
-    assessment = assessment_store.latest()
-    if not assessment:
-        return "No assessment available."
-
-    lines: list[str] = []
-    for artifact_uri in artifact_uris:
-        # Try to find artifact metadata in the assessment
-        for signal in assessment.signals:
-            if signal.artifact_uri == artifact_uri:
-                lines.append(f"- URI: {artifact_uri} (referenced by signal {signal.signal_id})")
-                break
-        else:
-            lines.append(f"- URI: {artifact_uri} (no signal reference found)")
-
-    return "\n".join(lines) if lines else "No artifacts found."
-
-
-def _build_history_context(
-    prior_failures: list[dict[str, Any]],
-    history_store: Any = None,
-) -> str:
-    """Build context from prior improvement outcomes for the LLM prompt."""
-    lines: list[str] = []
-
-    # Include prior failures from forking
-    for failure in prior_failures:
-        lines.append(
-            f"- Prior attempt #{failure.get('attempt_number', '?')}: "
-            f"strategy={failure.get('strategy', 'unknown')}, "
-            f"result={failure.get('result', 'unknown')}, "
-            f"reason={failure.get('failure_reason', 'unknown')}"
-        )
-
-    # Include historical outcomes from the history store
-    if history_store:
-        try:
-            recent = history_store.get_recent_outcomes(limit=5)
-            for outcome in recent:
-                lines.append(
-                    f"- Historical: issue={outcome.get('issue_type', '?')}, "
-                    f"strategy={outcome.get('strategy', '?')}, "
-                    f"result={outcome.get('result', '?')}, "
-                    f"score_change={outcome.get('score_change', 0)}"
-                )
-        except Exception:
-            pass
-
-    return "\n".join(lines) if lines else "No prior history available."
-
-
-def _cluster_signals(
-    signal_ids: list[str],
-    assessment_store: Any,
-) -> list[dict[str, Any]]:
-    """Cluster similar signals and return representative examples.
-
-    Objective 2 & 9: Instead of sending every signal to the LLM (which
-    wastes tokens), group signals by (collector_id, signal_type, artifact_uri)
-    and send one representative per cluster plus a count. This reduces
-    noise and token consumption while preserving diagnostic information.
-
-    Returns:
-        List of cluster dicts, each with:
-          - representative: the first signal in the cluster (full description)
-          - count: how many signals are in this cluster
-          - cluster_key: the grouping key
-          - all_signal_ids: list of all signal IDs in this cluster
-    """
-    if not assessment_store:
-        return []
-
-    assessment = assessment_store.latest()
-    if not assessment:
-        return []
-
-    # Group signals by (collector_id, signal_type, artifact_uri)
-    clusters: dict[str, dict[str, Any]] = {}
-    for signal in assessment.signals:
-        if signal.signal_id not in signal_ids:
-            continue
-        cluster_key = f"{signal.collector_id}|{signal.signal_type}|{signal.artifact_uri}"
-        if cluster_key not in clusters:
-            clusters[cluster_key] = {
-                "representative": (
-                    f"collector={signal.collector_id}, "
-                    f"type={signal.signal_type}, "
-                    f"severity={signal.severity.value}, "
-                    f"artifact={signal.artifact_uri}, "
-                    f"evidence={json.dumps(signal.evidence, default=str)[:200]}, "
-                    f"recommendation={signal.recommendation}, "
-                    f"ai_impact={signal.ai_impact}"
-                ),
-                "count": 1,
-                "cluster_key": cluster_key,
-                "all_signal_ids": [signal.signal_id],
-            }
-        else:
-            clusters[cluster_key]["count"] += 1
-            clusters[cluster_key]["all_signal_ids"].append(signal.signal_id)
-
-    return list(clusters.values())
-
-
-def _build_assessment_summary(
-    signal_ids: list[str],
-    artifact_uris: list[str],
-    assessment_store: Any,
-    clusters: list[dict[str, Any]] | None = None,
-) -> str:
-    """Build a compact, reusable assessment summary for LLM prompts.
-
-    Objective 2 & 9: This summary is built once in analyze_issue and
-    persisted in Burr state as `assessment_summary`. Later actions
-    (generate_proposal) reuse it instead of rebuilding context from
-    scratch, saving both compute and tokens.
-
-    The summary includes:
-      - Signal cluster representatives (not every signal)
-      - Artifact references with signal counts
-      - Overall severity distribution
-
-    Returns:
-        A compact text summary suitable for LLM prompts.
-    """
-    if not assessment_store:
-        return "No assessment store available."
-
-    assessment = assessment_store.latest()
-    if not assessment:
-        return "No assessment available."
-
-    if clusters is None:
-        clusters = _cluster_signals(signal_ids, assessment_store)
-
-    lines: list[str] = []
-    lines.append(f"Assessment: {assessment.assessment_id}")
-    lines.append(f"Total signals: {len(signal_ids)} (in {len(clusters)} cluster(s))")
-    lines.append(f"Affected artifacts: {len(artifact_uris)}")
-    lines.append("")
-
-    # Severity distribution
-    severity_counts: dict[str, int] = {}
-    for signal in assessment.signals:
-        if signal.signal_id in signal_ids:
-            sev = signal.severity.value
-            severity_counts[sev] = severity_counts.get(sev, 0) + 1
-    if severity_counts:
-        lines.append("Severity distribution: " + ", ".join(
-            f"{sev}={count}" for sev, count in sorted(severity_counts.items())
-        ))
-        lines.append("")
-
-    # Signal cluster representatives
-    lines.append("Signal clusters (representative shown, count indicates cluster size):")
-    for cluster in clusters:
-        rep = cluster["representative"]
-        count = cluster["count"]
-        if count > 1:
-            lines.append(f"  [{count}x] {rep}")
-        else:
-            lines.append(f"  {rep}")
-
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -248,37 +65,37 @@ def _build_assessment_summary(
 # ---------------------------------------------------------------------------
 
 @action(reads=["signal_ids", "affected_artifact_uris", "assessment_id", "prior_failures",
-               "prior_diagnosis", "prior_strategy", "prior_verification", "cumulative_tokens"],
+               "prior_diagnosis", "prior_strategy", "prior_verification", "cumulative_tokens",
+               "last_analysis_signal_ids", "skip_events"],
         writes=["root_cause_analysis", "knowledge_problems", "current_stage",
-                "llm_metadata", "decision_trace", "assessment_summary", "cumulative_tokens"])
+                "llm_metadata", "decision_trace", "assessment_summary", "cumulative_tokens",
+                "last_analysis_signal_ids", "skip_events", "problem_saliences"])
 def analyze_issue(state: State, llm_gateway: Any = None, assessment_store: Any = None,
-                  history_store: Any = None) -> State:
+                  history_store: Any = None,
+                  diagnosis_quality_tracker: Any = None) -> State:
     """Analyze assessment signals and determine root causes.
 
     Uses the LLM to reason about why the knowledge quality issues exist.
     The LLM receives signal descriptions and artifact references — it
     never accesses the knowledge base directly.
 
-    Focus 1: Identifies Knowledge Problems (underlying issues that produce
-    signals) rather than just listing signals. Multiple signals can stem
-    from the same problem.
+    Identifies Knowledge Problems (underlying issues that produce
+    signals) rather than just listing signals. Multiple signals can
+    stem from the same problem.
 
-    Focus 2: Retrieves historical context from prior remediation outcomes
-    for similar issue types, making institutional memory actionable.
+    Retrieves historical context from prior remediation outcomes for
+    similar issue types, making institutional memory actionable.
 
-    Focus 3: If this is a forked retry, includes prior diagnosis, strategy,
-    and verification from the failed attempt so the LLM can reason about
+    If this is a forked retry, includes prior diagnosis, strategy, and
+    verification from the failed attempt so the LLM can reason about
     why the prior approach failed.
-
-    Focus 7: Populates the DecisionTrace with knowledge problems, evidence,
-    and root cause reasoning.
 
     Writes:
       root_cause_analysis: list of RootCauseHypothesis dicts
-      knowledge_problems: list of KnowledgeProblem dicts (Focus 1)
+      knowledge_problems: list of KnowledgeProblem dicts
       current_stage: "root_cause_found" or "failed_analysis"
       llm_metadata: updated with call info
-      decision_trace: updated with analysis-stage reasoning (Focus 7)
+      decision_trace: updated with analysis-stage reasoning
     """
     signal_ids = state["signal_ids"]
     artifact_uris = state["affected_artifact_uris"]
@@ -287,26 +104,90 @@ def analyze_issue(state: State, llm_gateway: Any = None, assessment_store: Any =
     prior_strategy = state.get("prior_strategy", {})
     prior_verification = state.get("prior_verification", {})
     cumulative_tokens = state.get("cumulative_tokens", 0)
+    last_analysis_signal_ids = state.get("last_analysis_signal_ids", [])
+    skip_events = list(state.get("skip_events", []))
 
-    # Obj 2 & 9: Cluster signals and build a compact reusable assessment summary
-    clusters = _cluster_signals(signal_ids, assessment_store)
-    assessment_summary = _build_assessment_summary(
+    # --- Signal-Delta Eligibility Gate (deterministic, no LLM) ---
+    # Only invoke LLM analysis when new signals have appeared since the
+    # last analysis. This prevents wasted LLM calls on unchanged state.
+    eligibility = check_signal_delta(signal_ids, last_analysis_signal_ids if last_analysis_signal_ids else None)
+
+    # --- Heuristic Pre-Analysis (deterministic, no LLM) ---
+    # Always run heuristic discovery as a baseline. This provides problem
+    # candidates even without an LLM. When an LLM is available, it can
+    # enhance these with richer root cause hypotheses.
+    assessment = assessment_store.latest() if assessment_store else None
+    heuristic_problems_result, heuristic_hypotheses = discover_problems_heuristic(signal_ids, assessment)
+
+    # Cluster signals and build a compact reusable assessment summary
+    clusters = cluster_signals(signal_ids, assessment_store)
+    assessment_summary = build_assessment_summary(
         signal_ids, artifact_uris, assessment_store, clusters
     )
+
+    # If not eligible (no new signals), use heuristic analysis only and skip LLM
+    if not eligibility.eligible and heuristic_problems_result:
+        skip_events.append(SkipEvent(
+            lane="llm_analysis",
+            reason=eligibility.reason,
+            context={"signal_count": len(signal_ids), "heuristic_problem_count": len(heuristic_problems_result)},
+        ).to_dict())
+
+        # Rank heuristic problems by salience (deterministic)
+        ranked_problems, saliences, skipped_problems = rank_problems_by_salience(
+            heuristic_problems_result, assessment, history_store,
+        )
+
+        # Record skipped low-salience problems
+        for sp in skipped_problems:
+            skip_events.append(SkipEvent(
+                lane="problem_processing",
+                reason=f"Low salience problem skipped: {sp.category}",
+                context={"problem_id": sp.problem_id},
+            ).to_dict())
+
+        decision_trace = DecisionTrace.from_dict(state.get("decision_trace", {}))
+        decision_trace.knowledge_problems = [kp.to_dict() for kp in ranked_problems]
+        decision_trace.supporting_evidence = [
+            {"hypothesis": h.hypothesis, "evidence": h.evidence, "confidence": h.confidence}
+            for h in heuristic_hypotheses
+        ]
+        decision_trace.root_cause_reasoning = (
+            f"Heuristic analysis only (no LLM — {eligibility.reason}). "
+            f"Identified {len(heuristic_hypotheses)} hypothesis(es) and "
+            f"{len(ranked_problems)} knowledge problem(s) from {len(signal_ids)} signal(s). "
+            f"Salience ranking: {len(saliences)} above threshold, {len(skipped_problems)} skipped."
+        )
+
+        return state.update(
+            root_cause_analysis=[h.to_dict() for h in heuristic_hypotheses],
+            knowledge_problems=[kp.to_dict() for kp in ranked_problems],
+            current_stage=RemediationStatus.ROOT_CAUSE_FOUND.value if ranked_problems
+                          else RemediationStatus.FAILED_ANALYSIS.value,
+            llm_metadata={**state.get("llm_metadata", {}), "analyze_issue": {
+                "provider": "none", "model": "heuristic", "reason": eligibility.reason,
+            }},
+            decision_trace=decision_trace.to_dict(),
+            assessment_summary=assessment_summary,
+            cumulative_tokens=cumulative_tokens,
+            last_analysis_signal_ids=signal_ids,
+            skip_events=skip_events,
+            problem_saliences=[s.to_dict() for s in saliences],
+        )
 
     # Use clustered signal context (representative examples) instead of raw signal list
     signal_context = "\n".join(
         f"  [{c['count']}x] {c['representative']}" if c["count"] > 1 else f"  {c['representative']}"
         for c in clusters
-    ) if clusters else _build_signal_context(signal_ids, assessment_store)
+    ) if clusters else build_signal_context(signal_ids, assessment_store)
 
-    artifact_context = _build_artifact_context(artifact_uris, assessment_store)
-    history_context = _build_history_context(prior_failures, history_store)
+    artifact_context = build_artifact_context(artifact_uris, assessment_store)
+    history_context = build_history_context(prior_failures, history_store)
 
-    # Focus 3: Build prior attempt context for forked retries
+    # Build prior attempt context for forked retries
     prior_attempt_context = ""
     if prior_diagnosis or prior_strategy:
-        prior_attempt_context = f"""## Prior Failed Attempt (Forked Retry — Focus 3)
+        prior_attempt_context = f"""## Prior Failed Attempt (Forked Retry)
 
 ### Prior Diagnosis
 {json.dumps(prior_diagnosis, indent=2, default=str) if prior_diagnosis else "None"}
@@ -319,7 +200,7 @@ def analyze_issue(state: State, llm_gateway: Any = None, assessment_store: Any =
 
 IMPORTANT: The prior strategy above FAILED. You must identify why it failed and propose a DIFFERENT root cause or a different approach to the same root cause."""
 
-    # Focus 2: Retrieve historical remediation context
+    # Retrieve historical remediation context
     remediation_context_str = ""
     if history_store:
         try:
@@ -329,12 +210,12 @@ IMPORTANT: The prior strategy above FAILED. You must identify why it failed and 
                 artifact_uris=artifact_uris,
             )
             if remediation_context.get("total_prior_attempts", 0) > 0:
-                remediation_context_str = f"""## Historical Remediation Outcomes (Focus 2)
+                remediation_context_str = f"""## Historical Remediation Outcomes
 {json.dumps(remediation_context, indent=2, default=str)}"""
         except Exception:
             pass
 
-    # Obj 8: Enhanced system prompt — distinguish observations from causes,
+    # Enhanced system prompt — distinguish observations from causes,
     # reason about tradeoffs, focus on improving the knowledge system
     system_prompt = """You are a knowledge quality analyst. You analyze signals from a knowledge assessment system and determine root causes for quality issues.
 
@@ -377,6 +258,16 @@ Respond in JSON format:
 Be specific and evidence-based. Do not speculate beyond what the signals show.
 If prior attempts failed, explain WHY the prior strategy failed and how your analysis differs."""
 
+    # Diagnosis quality calibration (deterministic feedback loop)
+    calibration_text = ""
+    if diagnosis_quality_tracker:
+        try:
+            calibration_text = diagnosis_quality_tracker.get_calibration_text()
+            if calibration_text:
+                calibration_text = f"## Diagnosis Quality Calibration\n{calibration_text}\n"
+        except Exception:
+            pass
+
     user_prompt = f"""Analyze the following knowledge quality signals and determine root causes.
 
 ## Assessment Summary (clustered signals — representative shown with cluster count)
@@ -392,13 +283,14 @@ If prior attempts failed, explain WHY the prior strategy failed and how your ana
 
 {remediation_context_str}
 
+{calibration_text}
 Provide your root cause analysis as JSON. Remember: distinguish observations from causes."""
 
     try:
         if llm_gateway is None:
             # No LLM available — produce a basic heuristic analysis
-            hypotheses = [_heuristic_analysis(signal_ids, artifact_uris, assessment_store)]
-            knowledge_problems = _heuristic_problems(hypotheses, signal_ids, artifact_uris)
+            hypotheses = [heuristic_analysis(signal_ids, artifact_uris, assessment_store)]
+            knowledge_problems = heuristic_problems(hypotheses, signal_ids, artifact_uris)
             llm_meta = {"provider": "none", "model": "heuristic"}
         else:
             response = llm_gateway.chat(
@@ -410,7 +302,7 @@ Provide your root cause analysis as JSON. Remember: distinguish observations fro
                 max_tokens=2048,
             )
 
-            hypotheses, knowledge_problems = _parse_hypotheses_and_problems(
+            hypotheses, knowledge_problems = parse_hypotheses_and_problems(
                 response.content, signal_ids, artifact_uris
             )
             llm_meta = {
@@ -421,11 +313,11 @@ Provide your root cause analysis as JSON. Remember: distinguish observations fro
                 "latency_ms": response.latency_ms,
             }
 
-        # Obj 9: Track cumulative tokens across all actions
+        # Track cumulative tokens across all actions
         action_tokens = (llm_meta.get("prompt_tokens", 0) or 0) + (llm_meta.get("completion_tokens", 0) or 0)
         cumulative_tokens += action_tokens
 
-        # Focus 7: Populate DecisionTrace with analysis-stage reasoning
+        # Populate DecisionTrace with analysis-stage reasoning
         decision_trace = DecisionTrace.from_dict(state.get("decision_trace", {}))
         decision_trace.knowledge_problems = [kp.to_dict() for kp in knowledge_problems]
         decision_trace.supporting_evidence = [
@@ -442,17 +334,38 @@ Provide your root cause analysis as JSON. Remember: distinguish observations fro
                 " Prior attempt context was provided for forked retry."
             )
 
+        # --- Salience Ranking (deterministic, no LLM) ---
+        # Rank knowledge problems by quantitative salience score and
+        # filter out low-salience ones to reduce token waste.
+        ranked_problems, saliences, skipped_problems = rank_problems_by_salience(
+            knowledge_problems, assessment, history_store,
+        )
+        for sp in skipped_problems:
+            skip_events.append(SkipEvent(
+                lane="problem_processing",
+                reason=f"Low salience problem skipped: {sp.category}",
+                context={"problem_id": sp.problem_id},
+            ).to_dict())
+
+        decision_trace.root_cause_reasoning += (
+            f" Salience ranking: {len(saliences)} above threshold, "
+            f"{len(skipped_problems)} skipped."
+        )
+
         updates = {
             "root_cause_analysis": [h.to_dict() for h in hypotheses],
-            "knowledge_problems": [kp.to_dict() for kp in knowledge_problems],
+            "knowledge_problems": [kp.to_dict() for kp in ranked_problems],
             "current_stage": RemediationStatus.ROOT_CAUSE_FOUND.value,
             "llm_metadata": {**state.get("llm_metadata", {}), "analyze_issue": llm_meta},
             "decision_trace": decision_trace.to_dict(),
-            "assessment_summary": assessment_summary,  # Obj 2, 9: persist for reuse
-            "cumulative_tokens": cumulative_tokens,  # Obj 9: running total
+            "assessment_summary": assessment_summary,
+            "cumulative_tokens": cumulative_tokens,
+            "last_analysis_signal_ids": signal_ids,
+            "skip_events": skip_events,
+            "problem_saliences": [s.to_dict() for s in saliences],
         }
 
-        if not hypotheses:
+        if not hypotheses or not ranked_problems:
             updates["current_stage"] = RemediationStatus.FAILED_ANALYSIS.value
 
         return state.update(**updates)
@@ -462,208 +375,9 @@ Provide your root cause analysis as JSON. Remember: distinguish observations fro
         return state.update(
             current_stage=RemediationStatus.FAILED_ANALYSIS.value,
             llm_metadata={**state.get("llm_metadata", {}), "analyze_issue": {"error": str(e)}},
+            last_analysis_signal_ids=signal_ids,
+            skip_events=skip_events,
         )
-
-
-def _extract_json(content: str) -> str:
-    """Extract the first complete JSON object from an LLM response.
-
-    LLMs often wrap JSON in markdown fences or add explanatory text
-    before/after the JSON. This function finds the first '{' and its
-    matching '}' using brace counting, handling strings and escapes.
-    If the JSON is truncated (missing closing braces), they are appended.
-    """
-    content = content.strip()
-
-    # Strip markdown code fences
-    if content.startswith("```"):
-        lines = content.split("\n")
-        # Remove first line (```json or ```) and last line (```)
-        if len(lines) > 2 and lines[-1].strip() == "```":
-            content = "\n".join(lines[1:-1])
-        elif len(lines) > 1:
-            content = "\n".join(lines[1:])
-
-    # Find the first complete JSON object using brace/bracket counting
-    start = content.find("{")
-    if start == -1:
-        start = content.find("[")
-        if start == -1:
-            return content  # No JSON found, return as-is
-
-    brace_depth = 0
-    bracket_depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(content)):
-        ch = content[i]
-        if escape:
-            escape = False
-            continue
-        if ch == "\\":
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            brace_depth += 1
-        elif ch == "}":
-            brace_depth -= 1
-        elif ch == "[":
-            bracket_depth += 1
-        elif ch == "]":
-            bracket_depth -= 1
-
-        # Return when everything is balanced
-        if brace_depth == 0 and bracket_depth == 0 and i > start:
-            return content[start:i + 1]
-
-    # JSON is truncated — append missing closing braces/brackets
-    suffix = "]" * max(0, bracket_depth) + "}" * max(0, brace_depth)
-    return content[start:] + suffix
-
-
-def _repair_json(json_str: str) -> str:
-    """Attempt to fix common JSON syntax errors produced by LLMs.
-
-    Uses a line-based approach to add missing commas between lines
-    that need them, avoiding false matches inside string values.
-    """
-    lines = json_str.split("\n")
-    fixed_lines = []
-    for i, line in enumerate(lines):
-        stripped = line.rstrip()
-        if i + 1 < len(lines):
-            next_stripped = lines[i + 1].lstrip()
-            # Add comma if this line ends with a value/bracket (not comma/colon)
-            # and the next line starts with a key/bracket
-            if (stripped.endswith('"') or stripped.endswith(']') or stripped.endswith('}')) and \
-               not stripped.endswith(',') and not stripped.endswith(':') and \
-               not stripped.endswith('[') and not stripped.endswith('{') and \
-               (next_stripped.startswith('"') or next_stripped.startswith('[')
-                or next_stripped.startswith('{')):
-                fixed_lines.append(stripped + ",")
-            else:
-                fixed_lines.append(line)
-        else:
-            fixed_lines.append(line)
-
-    result = "\n".join(fixed_lines)
-
-    # Remove trailing commas before } or ]
-    import re
-    result = re.sub(r',\s*([}\]])', r'\1', result)
-
-    return result
-
-
-def _parse_hypotheses_and_problems(
-    content: str,
-    signal_ids: list[str],
-    artifact_uris: list[str],
-) -> tuple[list[RootCauseHypothesis], list[KnowledgeProblem]]:
-    """Parse LLM response into RootCauseHypothesis and KnowledgeProblem objects.
-
-    The LLM is asked to return both hypotheses and knowledge_problems in a
-    single JSON response. If knowledge_problems is missing, we synthesize
-    them from the hypotheses.
-    """
-    try:
-        content = content.strip()
-        # Extract just the JSON object (LLMs often add extra text)
-        json_str = _extract_json(content)
-
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError:
-            # Try repairing common JSON syntax errors from LLMs
-            repaired = _repair_json(json_str)
-            data = json.loads(repaired)
-
-        hypotheses_data = data.get("hypotheses", data if isinstance(data, list) else [])
-        hypotheses = [RootCauseHypothesis.from_dict(h) for h in hypotheses_data]
-
-        problems_data = data.get("knowledge_problems", [])
-        if problems_data:
-            knowledge_problems = [KnowledgeProblem.from_dict(p) for p in problems_data]
-        else:
-            # Synthesize one problem per hypothesis if LLM didn't provide them
-            knowledge_problems = _heuristic_problems(hypotheses, signal_ids, artifact_uris)
-
-        return hypotheses, knowledge_problems
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        logger.warning(f"Failed to parse LLM hypotheses/problems: {e}")
-        # Fallback: create a single hypothesis from the raw response
-        hypotheses = [RootCauseHypothesis(
-            hypothesis=content[:500],
-            evidence=["LLM response could not be parsed as JSON"],
-            confidence=0.3,
-            category="unknown",
-        )]
-        knowledge_problems = _heuristic_problems(hypotheses, signal_ids, artifact_uris)
-        return hypotheses, knowledge_problems
-
-
-def _parse_hypotheses(content: str) -> list[RootCauseHypothesis]:
-    """Parse LLM response into RootCauseHypothesis objects (legacy, for backward compat)."""
-    try:
-        content = content.strip()
-        if content.startswith("```"):
-            lines = content.split("\n")
-            content = "\n".join(lines[1:-1]) if len(lines) > 2 else content
-
-        data = json.loads(content)
-        hypotheses_data = data.get("hypotheses", data if isinstance(data, list) else [])
-        return [RootCauseHypothesis.from_dict(h) for h in hypotheses_data]
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        logger.warning(f"Failed to parse LLM hypotheses: {e}")
-        return [RootCauseHypothesis(
-            hypothesis=content[:500],
-            evidence=["LLM response could not be parsed as JSON"],
-            confidence=0.3,
-            category="unknown",
-        )]
-
-
-def _heuristic_problems(
-    hypotheses: list[RootCauseHypothesis],
-    signal_ids: list[str],
-    artifact_uris: list[str],
-) -> list[KnowledgeProblem]:
-    """Synthesize Knowledge Problems from hypotheses when LLM doesn't provide them.
-
-    Each hypothesis becomes one Knowledge Problem, with all signals and
-    artifacts assigned to it.
-    """
-    problems = []
-    for idx, h in enumerate(hypotheses):
-        problem_id = f"kp_{h.category or 'unknown'}_{idx}"
-        kp = KnowledgeProblem(
-            problem_id=problem_id,
-            category=h.category or "unknown",
-            description=h.hypothesis,
-            root_cause_idx=idx,
-            signal_ids=signal_ids,
-            artifact_uris=h.affected_artifact_uris or artifact_uris,
-            evidence_summary="; ".join(h.evidence),
-        )
-        problems.append(kp)
-    return problems
-
-
-def _heuristic_analysis(signal_ids: list[str], artifact_uris: list[str],
-                         assessment_store: Any) -> RootCauseHypothesis:
-    """Produce a basic heuristic root cause when no LLM is available."""
-    return RootCauseHypothesis(
-        hypothesis=f"Quality issues detected in {len(artifact_uris)} artifact(s) with {len(signal_ids)} signal(s). Manual analysis required.",
-        evidence=[f"{len(signal_ids)} signals detected", f"{len(artifact_uris)} artifacts affected"],
-        confidence=0.3,
-        affected_artifact_uris=artifact_uris,
-        category="unknown",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -672,30 +386,27 @@ def _heuristic_analysis(signal_ids: list[str], artifact_uris: list[str],
 
 @action(reads=["root_cause_analysis", "knowledge_problems", "affected_artifact_uris",
                "prior_failures", "assessment_id", "prior_diagnosis", "prior_strategy",
-               "prior_verification", "decision_trace", "assessment_summary", "cumulative_tokens"],
+               "prior_verification", "decision_trace", "assessment_summary", "cumulative_tokens",
+               "problem_saliences"],
         writes=["proposals", "selected_proposal_idx", "current_stage", "llm_metadata",
                 "decision_trace", "cumulative_tokens"])
 def generate_proposal(state: State, llm_gateway: Any = None, history_store: Any = None) -> State:
     """Generate improvement strategies based on root cause analysis.
 
-    Focus 2: Retrieves structured historical context (successful/failed
-    strategies, strategy stats) from the history store and passes it to
-    the LLM.
+    Retrieves structured historical context (successful/failed strategies,
+    strategy stats) from the history store and passes it to the LLM.
 
-    Focus 5: Provides 3-source context to the LLM:
+    Provides 3-source context to the LLM:
       1. Root cause analysis + Knowledge Problems (what's wrong)
       2. Historical remediation outcomes (what worked/failed before)
       3. Prior failed attempts from forking (what to avoid)
-
-    Focus 7: Populates DecisionTrace with historical context used and
-    proposal reasoning.
 
     Writes:
       proposals: list of RemediationProposal dicts
       selected_proposal_idx: 0 (first proposal by default)
       current_stage: "proposal_generated"
       llm_metadata: updated with call info
-      decision_trace: updated with proposal-stage reasoning (Focus 7)
+      decision_trace: updated with proposal-stage reasoning
     """
     root_causes = state.get("root_cause_analysis", [])
     knowledge_problems = state.get("knowledge_problems", [])
@@ -705,11 +416,11 @@ def generate_proposal(state: State, llm_gateway: Any = None, history_store: Any 
     prior_strategy = state.get("prior_strategy", {})
     cumulative_tokens = state.get("cumulative_tokens", 0)
 
-    # Obj 2 & 9: Reuse the assessment summary from analyze_issue instead of
+    # Reuse the assessment summary from analyze_issue instead of
     # rebuilding context from scratch. Fall back to building it if missing.
     assessment_summary = state.get("assessment_summary", "")
     if not assessment_summary:
-        assessment_summary = _build_assessment_summary(
+        assessment_summary = build_assessment_summary(
             state.get("signal_ids", []), artifact_uris, None
         )
 
@@ -723,21 +434,37 @@ def generate_proposal(state: State, llm_gateway: Any = None, history_store: Any 
         for f in prior_failures
     ) or "No prior attempts."
 
-    # Focus 3: Prior forked attempt context (compact — just strategy name and why it failed)
+    # Include salience ranking so the LLM knows which problems are most important
+    salience_scores = state.get("problem_saliences", [])
+    salience_text = ""
+    if salience_scores:
+        salience_lines = [
+            f"- {s['problem_id']}: total={s['total']:.4f} "
+            f"(encoding={s['encoding']:.2f}, outcome={s['outcome']:.2f}, "
+            f"retrieval={s['retrieval']:.2f})"
+            for s in salience_scores
+        ]
+        salience_text = f"""## Problem Salience Ranking (deterministic)
+Problems are ranked by quantitative salience score. Focus on highest-salience problems first.
+{chr(10).join(salience_lines)}
+"""
+
+    # Prior forked attempt context (compact — just strategy name and why it failed)
     prior_attempt_text = ""
     if prior_strategy:
         prior_strategy_summary = (
             f"Strategy: {prior_strategy.get('strategy', 'unknown')}, "
             f"Description: {prior_strategy.get('description', 'N/A')[:200]}"
         )
-        prior_attempt_text = f"""## Prior Failed Strategy (Forked Retry — Focus 3)
+        prior_attempt_text = f"""## Prior Failed Strategy (Forked Retry)
 The following strategy was tried in a prior attempt and FAILED:
 {prior_strategy_summary}
 
 You MUST propose a DIFFERENT strategy. Explain why your proposal differs from the prior failed attempt."""
 
-    # Focus 2: Get structured historical context from history store
+    # Get structured historical context from history store
     remediation_context_str = "No historical context available."
+    ema_context_str = ""
     if history_store and root_causes:
         issue_type = root_causes[0].get("category", "")
         if issue_type:
@@ -750,10 +477,28 @@ You MUST propose a DIFFERENT strategy. Explain why your proposal differs from th
                     remediation_context_str = json.dumps(remediation_context, indent=2, default=str)[:1500]
                 else:
                     remediation_context_str = "No prior outcomes for this issue type."
+
+                # EMA-based strategy scoring (deterministic, no LLM)
+                ema_data = remediation_context.get("strategy_ema", {})
+                ema_strategies = ema_data.get("strategies", [])
+                if ema_strategies:
+                    ema_lines = [
+                        f"- {s['strategy']}: EMA={s['adjusted_ema']:.2f} "
+                        f"(observations={s['observation_count']}, "
+                        f"last={s['last_outcome']})"
+                        for s in ema_strategies
+                    ]
+                    ema_context_str = f"""## Strategy EMA Scores (deterministic — learned from history)
+Strategies ranked by predicted success probability (EMA). Higher = more likely to succeed.
+Recent outcomes weigh more than old ones. Diversity floor prevents rare strategies from being suppressed.
+{chr(10).join(ema_lines)}
+
+PREFER strategies with EMA > 0.5. AVOID strategies with EMA < 0.3 unless you have a specific reason.
+"""
             except Exception:
                 remediation_context_str = "History store unavailable."
 
-    # Obj 8: Enhanced system prompt — focus on improving the knowledge system,
+    # Enhanced system prompt — focus on improving the knowledge system,
     # not just fixing signals. Ask for tradeoffs, minimal modifications,
     # confidence, assumptions, rollback considerations.
     system_prompt = """You are a knowledge improvement strategist. Given root cause analysis of knowledge quality issues, propose specific improvement strategies.
@@ -802,7 +547,7 @@ Respond in JSON format:
 
     user_prompt = f"""Generate improvement proposals for the following root causes.
 
-## Assessment Summary (reused from analysis — Obj 2, 9)
+## Assessment Summary (reused from analysis)
 {assessment_summary}
 
 ## Root Cause Analysis (Source 1: What's Wrong)
@@ -810,6 +555,8 @@ Respond in JSON format:
 
 ## Knowledge Problems
 {problems_text}
+
+{salience_text}
 
 ## Affected Artifacts
 {json.dumps(artifact_uris, indent=2)}
@@ -822,11 +569,12 @@ Respond in JSON format:
 ## Historical Remediation Outcomes (Source 2: What Worked Before)
 {remediation_context_str}
 
+{ema_context_str}
 Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge system, not just fixing signals. Include reasoning, confidence, assumptions, and rollback considerations."""
 
     try:
         if llm_gateway is None:
-            proposals = [_heuristic_proposal(root_causes, artifact_uris, prior_strategies)]
+            proposals = [heuristic_proposal(root_causes, artifact_uris, prior_strategies)]
             llm_meta = {"provider": "none", "model": "heuristic"}
         else:
             response = llm_gateway.chat(
@@ -838,7 +586,7 @@ Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge sys
                 max_tokens=4096,
             )
 
-            proposals = _parse_proposals(response.content)
+            proposals = parse_proposals(response.content)
             llm_meta = {
                 "provider": response.provider,
                 "model": response.model,
@@ -847,15 +595,15 @@ Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge sys
                 "latency_ms": response.latency_ms,
             }
 
-        # Obj 4: Reject generic proposals — strategies that are too vague
+        # Reject generic proposals — strategies that are too vague
         # to be actionable are filtered out
-        proposals = _reject_generic_proposals(proposals, prior_strategies)
+        proposals = reject_generic_proposals(proposals, prior_strategies)
 
-        # Obj 9: Track cumulative tokens across all actions
+        # Track cumulative tokens across all actions
         action_tokens = (llm_meta.get("prompt_tokens", 0) or 0) + (llm_meta.get("completion_tokens", 0) or 0)
         cumulative_tokens += action_tokens
 
-        # Focus 7: Update DecisionTrace with proposal-stage reasoning
+        # Update DecisionTrace with proposal-stage reasoning
         decision_trace = DecisionTrace.from_dict(state.get("decision_trace", {}))
         decision_trace.historical_context_used = remediation_context_str[:500]
         if proposals:
@@ -887,93 +635,6 @@ Propose 1-3 improvement strategies as JSON. Focus on improving the knowledge sys
         )
 
 
-def _parse_proposals(content: str) -> list[RemediationProposal]:
-    """Parse LLM response into RemediationProposal objects."""
-    try:
-        content = content.strip()
-        # Extract just the JSON object (LLMs often add extra text)
-        json_str = _extract_json(content)
-
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError:
-            # Try repairing common JSON syntax errors from LLMs
-            repaired = _repair_json(json_str)
-            data = json.loads(repaired)
-
-        proposals_data = data.get("proposals", data if isinstance(data, list) else [])
-        return [RemediationProposal.from_dict(p) for p in proposals_data]
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        logger.warning(f"Failed to parse LLM proposals: {e}")
-        return [RemediationProposal(
-            strategy="manual_review",
-            description=f"LLM response could not be parsed. Raw: {content[:200]}",
-            expected_impact="unknown",
-            risks=["LLM parsing failure"],
-        )]
-
-
-def _reject_generic_proposals(
-    proposals: list[RemediationProposal],
-    prior_strategies: list[str],
-) -> list[RemediationProposal]:
-    """Filter out generic or duplicate proposals.
-
-    Objective 4: Generic proposals that are too vague to be actionable
-    are filtered out. Proposals that match a prior failed strategy name
-    are also rejected to prevent retrying the same approach.
-
-    A proposal is rejected if:
-      1. Strategy name is empty or "unknown"
-      2. Description is fewer than 20 characters (too vague)
-      3. No modification steps provided
-      4. Strategy name matches a prior failed strategy (exact match)
-    """
-    GENERIC_STRATEGIES = {"unknown", "", "manual_review", "fix", "improve"}
-    filtered = []
-    for p in proposals:
-        # Reject empty/unknown strategies
-        if p.strategy.lower() in GENERIC_STRATEGIES:
-            logger.info(f"Rejecting generic proposal: strategy='{p.strategy}'")
-            continue
-        # Reject too-short descriptions
-        if len(p.description.strip()) < 20:
-            logger.info(f"Rejecting vague proposal: description too short ({len(p.description)} chars)")
-            continue
-        # Reject proposals with no modification steps
-        if not p.modification_steps:
-            logger.info(f"Rejecting proposal with no steps: strategy='{p.strategy}'")
-            continue
-        # Reject proposals that match prior failed strategies (case-insensitive)
-        if p.strategy.lower() in [s.lower() for s in prior_strategies]:
-            logger.info(f"Rejecting duplicate strategy: '{p.strategy}' matches prior failure")
-            continue
-        filtered.append(p)
-    return filtered
-
-
-def _heuristic_proposal(root_causes: list[dict], artifact_uris: list[str],
-                         prior_strategies: list[str]) -> RemediationProposal:
-    """Produce a basic proposal when no LLM is available."""
-    strategy = "manual_review"
-    if root_causes:
-        category = root_causes[0].get("category", "")
-        if category and category not in prior_strategies:
-            strategy = f"address_{category}"
-
-    return RemediationProposal(
-        strategy=strategy,
-        description=f"Heuristic proposal: address {len(root_causes)} root cause(s) in {len(artifact_uris)} artifact(s).",
-        expected_impact="unknown",
-        risks=["No LLM available for detailed analysis"],
-        affected_artifact_uris=artifact_uris,
-        modification_steps=[
-            {"step_type": "update_document", "artifact_uri": uri, "description": "Manual review and update", "parameters": {}}
-            for uri in artifact_uris
-        ],
-    )
-
-
 # ---------------------------------------------------------------------------
 # Action: Review Approval
 # ---------------------------------------------------------------------------
@@ -989,12 +650,9 @@ def review_approval(state: State) -> State:
     When resumed, the approval_status will have been set externally
     (by the approval callback) to "approved" or "rejected".
 
-    Focus 7: Populates DecisionTrace with the proposal being reviewed
-    so the approval decision can be traced.
-
     Writes:
       current_stage: "waiting_for_approval"
-      decision_trace: updated with approval-stage info (Focus 7)
+      decision_trace: updated with approval-stage info
     """
     proposals = state.get("proposals", [])
     selected_idx = state.get("selected_proposal_idx", 0)
@@ -1002,7 +660,7 @@ def review_approval(state: State) -> State:
     if not proposals:
         return state.update(current_stage=RemediationStatus.FAILED_ANALYSIS.value)
 
-    # Focus 7: Record what's being submitted for approval
+    # Record what's being submitted for approval
     decision_trace = DecisionTrace.from_dict(state.get("decision_trace", {}))
     selected_proposal = proposals[selected_idx] if selected_idx < len(proposals) else {}
     decision_trace.approval_decision = (
@@ -1049,6 +707,11 @@ def execute_change(state: State, executor: Any = None) -> State:
     artifact_uris = state.get("affected_artifact_uris", [])
 
     if executor is None:
+        # Safety-net fallback: when no executor is injected (e.g., direct
+        # action calls in tests or validation scripts), create a dry-run
+        # executor. The manager always injects a real executor via
+        # _register_dependencies, so this path only triggers outside
+        # the normal workflow.
         from ai_ready.improvement.executor import KnowledgeExecutor
         executor = KnowledgeExecutor()  # Dry-run mode
 
@@ -1076,28 +739,27 @@ def execute_change(state: State, executor: Any = None) -> State:
 # ---------------------------------------------------------------------------
 
 @action(reads=["execution_history", "assessment_id", "signal_ids", "affected_artifact_uris",
-               "proposals", "selected_proposal_idx", "knowledge_problems", "decision_trace"],
+               "proposals", "selected_proposal_idx", "knowledge_problems", "decision_trace",
+               "root_cause_analysis"],
         writes=["verification_results", "current_stage", "decision_trace"])
 def verify_improvement(state: State, assessment_store: Any = None,
                        assessment_pipeline: Any = None,
                        artifacts: list[Any] = None,
                        relationships: list[Any] = None,
                        source: str = "",
-                       git_commit: str = "") -> State:
+                       git_commit: str = "",
+                       diagnosis_quality_tracker: Any = None) -> State:
     """Verify whether the improvement worked by re-running the assessment.
 
-    Focus 4: Verification operates at the Knowledge Problem level, not
-    individual signal level. For each Knowledge Problem identified during
-    analysis, we check whether its associated signals are resolved,
-    partially resolved, unchanged, regressed, or misdiagnosed.
-
-    Focus 7: Populates DecisionTrace with verification reasoning and
-    final outcome explanation.
+    Verification operates at the Knowledge Problem level, not individual
+    signal level. For each Knowledge Problem identified during analysis,
+    we check whether its associated signals are resolved, partially
+    resolved, unchanged, regressed, or misdiagnosed.
 
     Writes:
       verification_results: VerificationResult dict with problem_verifications
       current_stage: "completed" or "failed_verification"
-      decision_trace: updated with verification-stage reasoning (Focus 7)
+      decision_trace: updated with verification-stage reasoning
     """
     execution_history = state.get("execution_history", [])
     if not execution_history or not all(step.get("success", False) for step in execution_history):
@@ -1172,7 +834,7 @@ def verify_improvement(state: State, assessment_store: Any = None,
 
         score_diff = after_score - before_score
 
-        # Focus 4: Problem-level verification
+        # Problem-level verification
         problem_verifications = []
         for kp_dict in knowledge_problems:
             kp = KnowledgeProblem.from_dict(kp_dict)
@@ -1304,7 +966,7 @@ def verify_improvement(state: State, assessment_store: Any = None,
         if assessment_store:
             assessment_store.save(after_assessment)
 
-        # Focus 7: Update DecisionTrace with verification reasoning
+        # Update DecisionTrace with verification reasoning
         decision_trace = DecisionTrace.from_dict(state.get("decision_trace", {}))
         decision_trace.execution_summary = (
             f"Executed {len(execution_history)} step(s) with strategy '{strategy}'."
@@ -1317,6 +979,27 @@ def verify_improvement(state: State, assessment_store: Any = None,
         decision_trace.final_outcome = (
             f"{'SUCCESS' if success else 'FAILURE'}: {result.summary}"
         )
+
+        # Diagnosis quality feedback: record (confidence, outcome) observation
+        # This feeds the rolling correlation that detects diagnosis degradation.
+        if diagnosis_quality_tracker:
+            try:
+                root_causes = state.get("root_cause_analysis", [])
+                mean_confidence = 0.5
+                if root_causes:
+                    confidences = [rc.get("confidence", 0.5) for rc in root_causes]
+                    mean_confidence = sum(confidences) / len(confidences)
+                outcome_value = 1.0 if success else 0.0
+                if overall_outcome == VerificationOutcome.PARTIALLY_RESOLVED.value:
+                    outcome_value = 0.5
+                diagnosis_quality_tracker.record(
+                    confidence=mean_confidence,
+                    outcome=outcome_value,
+                    remediation_id=state.get("remediation_id", ""),
+                    metadata={"strategy": strategy, "overall_outcome": overall_outcome},
+                )
+            except Exception as e:
+                logger.warning(f"Diagnosis quality recording failed: {e}")
 
         return state.update(
             verification_results=result.to_dict(),
@@ -1344,27 +1027,24 @@ def verify_improvement(state: State, assessment_store: Any = None,
                "root_cause_analysis", "knowledge_problems", "attempt_number", "execution_history",
                "approval_status", "decision_trace"],
         writes=["prior_failures", "prior_diagnosis", "prior_strategy", "prior_verification",
-                "prior_execution", "current_stage", "decision_trace"])
+                "current_stage", "decision_trace"])
 def handle_failure(state: State) -> State:
     """Record failure and prepare state for potential forking.
 
-    Focus 3: Preserves the full prior diagnosis (root causes + knowledge
-    problems), the prior strategy (proposal that was selected and executed),
-    the prior verification result (with problem-level outcomes and failure
-    explanation), and the prior execution history. This allows a forked
-    retry to reason about WHY the prior approach failed and generate a
+    Preserves the full prior diagnosis (root causes + knowledge
+    problems), the prior strategy (proposal that was selected and
+    executed), and the prior verification result (with problem-level
+    outcomes and failure explanation). This allows a forked retry
+    to reason about WHY the prior approach failed and generate a
     genuinely different strategy.
-
-    Focus 7: Updates DecisionTrace with final outcome on failure.
 
     Writes:
       prior_failures: updated with this attempt's failure summary
-      prior_diagnosis: root causes + knowledge problems from this attempt (Focus 3)
-      prior_strategy: the selected proposal that was executed (Focus 3)
-      prior_verification: verification result with failure explanation (Focus 3)
-      prior_execution: execution history from this attempt (Focus 3)
+      prior_diagnosis: root causes + knowledge problems from this attempt
+      prior_strategy: the selected proposal that was executed
+      prior_verification: verification result with failure explanation
       current_stage: set to REJECTED if rejection, preserved otherwise
-      decision_trace: updated with final outcome (Focus 7)
+      decision_trace: updated with final outcome
     """
     proposals = state.get("proposals", [])
     selected_idx = state.get("selected_proposal_idx", 0)
@@ -1399,16 +1079,15 @@ def handle_failure(state: State) -> State:
     prior_failures = list(state.get("prior_failures", []))
     prior_failures.append(failure_summary)
 
-    # Focus 3: Preserve full context for forked retry
+    # Preserve full context for forked retry
     prior_diagnosis = {
         "root_causes": root_causes,
         "knowledge_problems": knowledge_problems,
     }
     prior_strategy = proposals[selected_idx] if selected_idx < len(proposals) else {}
     prior_verification = verification
-    prior_execution = execution_history
 
-    # Focus 7: Update DecisionTrace with final outcome
+    # Update DecisionTrace with final outcome
     decision_trace = DecisionTrace.from_dict(state.get("decision_trace", {}))
     if approval_status == "rejected":
         decision_trace.final_outcome = (
@@ -1428,7 +1107,6 @@ def handle_failure(state: State) -> State:
         prior_diagnosis=prior_diagnosis,
         prior_strategy=prior_strategy,
         prior_verification=prior_verification,
-        prior_execution=prior_execution,
         current_stage=new_stage,
         decision_trace=decision_trace.to_dict(),
     )
