@@ -46,3 +46,12 @@ fetch_reddit.py
 # Documents
 docs
 tests
+
+# env
+.env
+
+# Data
+baseline.db
+generated_tests
+improvement_history.db
+validation_results.json
