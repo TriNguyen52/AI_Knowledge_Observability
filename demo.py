@@ -50,7 +50,7 @@ from pathlib import Path
 DEFAULT_SOURCE = Path("C:/Users/jacks/Documents/khe-validation/fastapi")
 DEFAULT_DB = Path(".ai-ready/demo.db")
 
-# A deliberately bad documentation file used to trigger regression signals.
+# A bad documentation file used to trigger regression signals.
 # Contains: placeholder headings, dangling references, and a broken link.
 BAD_DOC = """\
 # TODO
@@ -63,6 +63,9 @@ As mentioned below, the API will be documented eventually.
 
 For more details, see [nonexistent page](./does-not-exist.md).
 
+## Placeholder
+
+Lorem ipsum dolor sit amet
 """
 
 
